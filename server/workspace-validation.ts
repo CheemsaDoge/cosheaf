@@ -1,5 +1,233 @@
 import type Database from "better-sqlite3";
-import type { WorkspaceValidation } from "../shared/validation.js";
+import type { TheoremStatus } from "../shared/theorem-status.js";
+import type {
+  CyclicReference,
+  TaintedReference,
+  WorkspaceValidation,
+} from "../shared/validation.js";
+
+export function workspaceTheoremValidation(
+  db: Database.Database,
+  workspaceSlug: string,
+): { tainted_refs: TaintedReference[]; cyclic_refs: CyclicReference[] } {
+  const docs = db
+    .prepare(
+      `SELECT cosheaf_id, forgejo_id, title, COALESCE(status, 'proved') AS status
+         FROM doc_map
+        WHERE workspace_slug = ?`,
+    )
+    .all(workspaceSlug) as Array<{
+    cosheaf_id: string;
+    forgejo_id: string;
+    title: string | null;
+    status: TheoremStatus;
+  }>;
+
+  const docById = new Map(docs.map((d) => [d.cosheaf_id, d]));
+  const docByPath = new Map(docs.map((d) => [d.forgejo_id, d]));
+
+  const xrefs = db
+    .prepare("SELECT target_id, source_path FROM xref_targets WHERE workspace_slug = ?")
+    .all(workspaceSlug) as Array<{ target_id: string; source_path: string }>;
+
+  const docByXref = new Map<string, (typeof docs)[number]>();
+  for (const x of xrefs) {
+    const doc = docByPath.get(x.source_path);
+    if (doc) {
+      docByXref.set(x.target_id, doc);
+    }
+  }
+
+  const links = db
+    .prepare(
+      `SELECT src_id, src_path, target_id, target_label, line
+         FROM backlinks
+        WHERE workspace_slug = ? AND target_id IS NOT NULL
+        ORDER BY src_path, line, target_label`,
+    )
+    .all(workspaceSlug) as Array<{
+    src_id: string;
+    src_path: string;
+    target_id: string;
+    target_label: string;
+    line: number | null;
+  }>;
+
+  function resolveTargetDoc(targetId: string): (typeof docs)[number] | null {
+    return docById.get(targetId) ?? docByXref.get(targetId) ?? null;
+  }
+
+  const adj = new Map<string, Set<string>>();
+  for (const doc of docs) {
+    adj.set(doc.cosheaf_id, new Set<string>());
+  }
+  for (const link of links) {
+    const srcDoc = docById.get(link.src_id) ?? docByPath.get(link.src_path);
+    const targetDoc = resolveTargetDoc(link.target_id);
+    if (srcDoc && targetDoc && srcDoc.cosheaf_id !== targetDoc.cosheaf_id) {
+      let neighbors = adj.get(srcDoc.cosheaf_id);
+      if (!neighbors) {
+        neighbors = new Set<string>();
+        adj.set(srcDoc.cosheaf_id, neighbors);
+      }
+      neighbors.add(targetDoc.cosheaf_id);
+    }
+  }
+
+  const taintedRefs: TaintedReference[] = [];
+
+  function findNearestTainted(
+    startDocId: string,
+    originDocId: string,
+  ): { targetDoc: (typeof docs)[number]; viaPath: string[] } | null {
+    const startDoc = docById.get(startDocId);
+    if (!startDoc) return null;
+
+    const queue: Array<{ id: string; path: string[] }> = [
+      { id: startDocId, path: [startDoc.forgejo_id] },
+    ];
+    const visited = new Set<string>([startDocId, originDocId]);
+
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (!current) break;
+
+      const neighbors = Array.from(adj.get(current.id) ?? []).sort((a, b) => {
+        const pathA = docById.get(a)?.forgejo_id ?? a;
+        const pathB = docById.get(b)?.forgejo_id ?? b;
+        return pathA.localeCompare(pathB);
+      });
+
+      for (const nextId of neighbors) {
+        if (visited.has(nextId)) continue;
+        visited.add(nextId);
+
+        const nextDoc = docById.get(nextId);
+        if (!nextDoc) continue;
+
+        const nextPath = [...current.path, nextDoc.forgejo_id];
+        if (nextDoc.status !== "proved") {
+          return { targetDoc: nextDoc, viaPath: nextPath };
+        }
+
+        queue.push({ id: nextId, path: nextPath });
+      }
+    }
+
+    return null;
+  }
+
+  for (const link of links) {
+    const srcDoc = docById.get(link.src_id) ?? docByPath.get(link.src_path);
+    if (!srcDoc || srcDoc.status !== "proved") continue;
+
+    const directDoc = resolveTargetDoc(link.target_id);
+    if (!directDoc || directDoc.cosheaf_id === srcDoc.cosheaf_id) continue;
+
+    if (directDoc.status !== "proved") {
+      taintedRefs.push({
+        source_id: srcDoc.cosheaf_id,
+        source_path: srcDoc.forgejo_id,
+        source_title: srcDoc.title,
+        target_id: directDoc.cosheaf_id,
+        target_path: directDoc.forgejo_id,
+        target_status: directDoc.status,
+        target_label: link.target_label,
+        line: link.line,
+      });
+    } else {
+      const tainted = findNearestTainted(directDoc.cosheaf_id, srcDoc.cosheaf_id);
+      if (tainted) {
+        taintedRefs.push({
+          source_id: srcDoc.cosheaf_id,
+          source_path: srcDoc.forgejo_id,
+          source_title: srcDoc.title,
+          target_id: tainted.targetDoc.cosheaf_id,
+          target_path: tainted.targetDoc.forgejo_id,
+          target_status: tainted.targetDoc.status,
+          target_label: link.target_label,
+          line: link.line,
+          via_path: tainted.viaPath,
+        });
+      }
+    }
+  }
+
+  let index = 0;
+  const indices = new Map<string, number>();
+  const lowlink = new Map<string, number>();
+  const onStack = new Map<string, boolean>();
+  const stack: string[] = [];
+  const sccs: string[][] = [];
+
+  function strongconnect(nodeId: string) {
+    indices.set(nodeId, index);
+    lowlink.set(nodeId, index);
+    index++;
+    stack.push(nodeId);
+    onStack.set(nodeId, true);
+
+    const neighbors = Array.from(adj.get(nodeId) ?? []).sort((a, b) => {
+      const pathA = docById.get(a)?.forgejo_id ?? a;
+      const pathB = docById.get(b)?.forgejo_id ?? b;
+      return pathA.localeCompare(pathB);
+    });
+
+    for (const w of neighbors) {
+      if (!indices.has(w)) {
+        strongconnect(w);
+        const currentLow = lowlink.get(nodeId) ?? 0;
+        const neighborLow = lowlink.get(w) ?? 0;
+        lowlink.set(nodeId, Math.min(currentLow, neighborLow));
+      } else if (onStack.get(w)) {
+        const currentLow = lowlink.get(nodeId) ?? 0;
+        const neighborIndex = indices.get(w) ?? 0;
+        lowlink.set(nodeId, Math.min(currentLow, neighborIndex));
+      }
+    }
+
+    if (lowlink.get(nodeId) === indices.get(nodeId)) {
+      const scc: string[] = [];
+      while (true) {
+        const w = stack.pop();
+        if (!w) break;
+        onStack.set(w, false);
+        scc.push(w);
+        if (w === nodeId) break;
+      }
+      sccs.push(scc);
+    }
+  }
+
+  const sortedDocIds = docs
+    .slice()
+    .sort((a, b) => a.forgejo_id.localeCompare(b.forgejo_id))
+    .map((d) => d.cosheaf_id);
+
+  for (const id of sortedDocIds) {
+    if (!indices.has(id)) {
+      strongconnect(id);
+    }
+  }
+
+  const cyclicRefs: CyclicReference[] = [];
+  for (const scc of sccs) {
+    if (scc.length > 1) {
+      const sccDocs = scc
+        .map((id) => docById.get(id))
+        .filter((d): d is (typeof docs)[number] => d !== undefined)
+        .sort((a, b) => a.forgejo_id.localeCompare(b.forgejo_id));
+      cyclicRefs.push({
+        cycle_ids: sccDocs.map((d) => d.cosheaf_id),
+        cycle_paths: sccDocs.map((d) => d.forgejo_id),
+      });
+    }
+  }
+
+  cyclicRefs.sort((a, b) => (a.cycle_paths[0] ?? "").localeCompare(b.cycle_paths[0] ?? ""));
+
+  return { tainted_refs: taintedRefs, cyclic_refs: cyclicRefs };
+}
 
 // These three reads are validation-only: they correlate backlinks against
 // doc_map / xref_targets / citation_targets (broken refs), doc_map against
@@ -85,5 +313,14 @@ export function workspaceValidation(
         ORDER BY id`,
     )
     .all(workspaceSlug, workspaceSlug) as WorkspaceValidation["duplicate_xrefs"];
-  return { broken_refs: brokenRefs, duplicate_xrefs: duplicateXrefs, orphan_labels: orphanLabels };
+
+  const { tainted_refs, cyclic_refs } = workspaceTheoremValidation(db, workspaceSlug);
+
+  return {
+    broken_refs: brokenRefs,
+    duplicate_xrefs: duplicateXrefs,
+    orphan_labels: orphanLabels,
+    ...(tainted_refs.length > 0 ? { tainted_refs } : {}),
+    ...(cyclic_refs.length > 0 ? { cyclic_refs } : {}),
+  };
 }
