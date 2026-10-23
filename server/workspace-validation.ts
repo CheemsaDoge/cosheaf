@@ -6,6 +6,12 @@ import type {
   WorkspaceValidation,
 } from "../shared/validation.js";
 
+interface TarjanFrame {
+  nodeId: string;
+  neighbors: readonly string[];
+  neighborIndex: number;
+}
+
 export function workspaceTheoremValidation(
   db: Database.Database,
   workspaceSlug: string,
@@ -74,6 +80,18 @@ export function workspaceTheoremValidation(
     }
   }
 
+  const sortedAdj = new Map<string, string[]>();
+  for (const [nodeId, neighbors] of adj) {
+    sortedAdj.set(
+      nodeId,
+      Array.from(neighbors).sort((a, b) => {
+        const pathA = docById.get(a)?.forgejo_id ?? a;
+        const pathB = docById.get(b)?.forgejo_id ?? b;
+        return pathA.localeCompare(pathB);
+      }),
+    );
+  }
+
   const taintedRefs: TaintedReference[] = [];
 
   function findNearestTainted(
@@ -81,36 +99,40 @@ export function workspaceTheoremValidation(
     originDocId: string,
   ): { targetDoc: (typeof docs)[number]; viaPath: string[] } | null {
     const startDoc = docById.get(startDocId);
-    if (!startDoc) return null;
+    if (startDoc === undefined) return null;
 
-    const queue: Array<{ id: string; path: string[] }> = [
-      { id: startDocId, path: [startDoc.forgejo_id] },
-    ];
+    const queue: string[] = [startDocId];
     const visited = new Set<string>([startDocId, originDocId]);
+    const parent = new Map<string, string>();
+    let head = 0;
 
-    while (queue.length > 0) {
-      const current = queue.shift();
-      if (!current) break;
+    while (head < queue.length) {
+      const currentId = queue[head];
+      head += 1;
+      if (currentId === undefined) continue;
 
-      const neighbors = Array.from(adj.get(current.id) ?? []).sort((a, b) => {
-        const pathA = docById.get(a)?.forgejo_id ?? a;
-        const pathB = docById.get(b)?.forgejo_id ?? b;
-        return pathA.localeCompare(pathB);
-      });
-
+      const neighbors = sortedAdj.get(currentId) ?? [];
       for (const nextId of neighbors) {
         if (visited.has(nextId)) continue;
         visited.add(nextId);
+        parent.set(nextId, currentId);
 
         const nextDoc = docById.get(nextId);
-        if (!nextDoc) continue;
+        if (nextDoc === undefined) continue;
 
-        const nextPath = [...current.path, nextDoc.forgejo_id];
         if (nextDoc.status !== "proved") {
-          return { targetDoc: nextDoc, viaPath: nextPath };
+          const viaPath: string[] = [];
+          let curr: string | undefined = nextId;
+          while (curr !== undefined) {
+            viaPath.push(docById.get(curr)?.forgejo_id ?? curr);
+            if (curr === startDocId) break;
+            curr = parent.get(curr);
+          }
+          viaPath.reverse();
+          return { targetDoc: nextDoc, viaPath };
         }
 
-        queue.push({ id: nextId, path: nextPath });
+        queue.push(nextId);
       }
     }
 
@@ -160,53 +182,75 @@ export function workspaceTheoremValidation(
   const stack: string[] = [];
   const sccs: string[][] = [];
 
-  function strongconnect(nodeId: string) {
-    indices.set(nodeId, index);
-    lowlink.set(nodeId, index);
-    index++;
-    stack.push(nodeId);
-    onStack.set(nodeId, true);
-
-    const neighbors = Array.from(adj.get(nodeId) ?? []).sort((a, b) => {
-      const pathA = docById.get(a)?.forgejo_id ?? a;
-      const pathB = docById.get(b)?.forgejo_id ?? b;
-      return pathA.localeCompare(pathB);
-    });
-
-    for (const w of neighbors) {
-      if (!indices.has(w)) {
-        strongconnect(w);
-        const currentLow = lowlink.get(nodeId) ?? 0;
-        const neighborLow = lowlink.get(w) ?? 0;
-        lowlink.set(nodeId, Math.min(currentLow, neighborLow));
-      } else if (onStack.get(w)) {
-        const currentLow = lowlink.get(nodeId) ?? 0;
-        const neighborIndex = indices.get(w) ?? 0;
-        lowlink.set(nodeId, Math.min(currentLow, neighborIndex));
-      }
-    }
-
-    if (lowlink.get(nodeId) === indices.get(nodeId)) {
-      const scc: string[] = [];
-      while (true) {
-        const w = stack.pop();
-        if (!w) break;
-        onStack.set(w, false);
-        scc.push(w);
-        if (w === nodeId) break;
-      }
-      sccs.push(scc);
-    }
-  }
-
   const sortedDocIds = docs
     .slice()
     .sort((a, b) => a.forgejo_id.localeCompare(b.forgejo_id))
     .map((d) => d.cosheaf_id);
 
-  for (const id of sortedDocIds) {
-    if (!indices.has(id)) {
-      strongconnect(id);
+  for (const rootId of sortedDocIds) {
+    if (!indices.has(rootId)) {
+      indices.set(rootId, index);
+      lowlink.set(rootId, index);
+      index += 1;
+      stack.push(rootId);
+      onStack.set(rootId, true);
+
+      const callStack: TarjanFrame[] = [
+        {
+          nodeId: rootId,
+          neighbors: sortedAdj.get(rootId) ?? [],
+          neighborIndex: 0,
+        },
+      ];
+
+      while (callStack.length > 0) {
+        const frame = callStack[callStack.length - 1];
+        if (frame === undefined) break;
+
+        if (frame.neighborIndex < frame.neighbors.length) {
+          const w = frame.neighbors[frame.neighborIndex];
+          frame.neighborIndex += 1;
+          if (w === undefined) continue;
+
+          if (!indices.has(w)) {
+            indices.set(w, index);
+            lowlink.set(w, index);
+            index += 1;
+            stack.push(w);
+            onStack.set(w, true);
+            callStack.push({
+              nodeId: w,
+              neighbors: sortedAdj.get(w) ?? [],
+              neighborIndex: 0,
+            });
+          } else if (onStack.get(w) === true) {
+            const currentLow = lowlink.get(frame.nodeId) ?? 0;
+            const neighborIndex = indices.get(w) ?? 0;
+            lowlink.set(frame.nodeId, Math.min(currentLow, neighborIndex));
+          }
+        } else {
+          callStack.pop();
+          if (callStack.length > 0) {
+            const parentFrame = callStack[callStack.length - 1];
+            if (parentFrame !== undefined) {
+              const parentLow = lowlink.get(parentFrame.nodeId) ?? 0;
+              const frameLow = lowlink.get(frame.nodeId) ?? 0;
+              lowlink.set(parentFrame.nodeId, Math.min(parentLow, frameLow));
+            }
+          }
+          if (lowlink.get(frame.nodeId) === indices.get(frame.nodeId)) {
+            const scc: string[] = [];
+            while (true) {
+              const popped = stack.pop();
+              if (popped === undefined) break;
+              onStack.set(popped, false);
+              scc.push(popped);
+              if (popped === frame.nodeId) break;
+            }
+            sccs.push(scc);
+          }
+        }
+      }
     }
   }
 
