@@ -293,6 +293,79 @@ status: draft
     }
   });
 
+  it("invokes lake env lean for file-only Lean verify specifications in a Lake project", () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), "cosheaf-lean-file-lake-"));
+    const binDir = path.join(tmpDir, "bin");
+    const workDir = path.join(tmpDir, "work");
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(workDir, { recursive: true });
+
+    const leanScript = path.join(binDir, "lean");
+    writeFileSync(
+      leanScript,
+      `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  exit 0
+fi
+printf 'Bare lean was invoked instead of lake env lean\\n'
+exit 1
+`,
+      "utf8",
+    );
+    chmodSync(leanScript, 0o755);
+
+    const lakeScript = path.join(binDir, "lake");
+    writeFileSync(
+      lakeScript,
+      `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  exit 0
+fi
+if [ "$1" = "env" ] && [ "$2" = "lean" ]; then
+  printf 'Lake env lean verification passed\\n'
+  exit 0
+fi
+printf 'Unexpected lake invocation\\n'
+exit 1
+`,
+      "utf8",
+    );
+    chmodSync(lakeScript, 0o755);
+
+    writeFileSync(path.join(workDir, "lakefile.lean"), "-- lakefile\n", "utf8");
+    writeFileSync(path.join(workDir, "Proof.lean"), "def proof : True := True.intro\n", "utf8");
+
+    writeFileSync(
+      path.join(workDir, "doc.md"),
+      `---
+id: lean-file-lake
+status: proved
+verify:
+  - kind: lean
+    file: Proof.lean
+---
+# Lean File Lake Test
+`,
+      "utf8",
+    );
+
+    const oldPath = process.env.PATH;
+    try {
+      process.env.PATH = `${binDir}:${oldPath}`;
+      const result = verifyLocalWorkspace({ dir: workDir });
+      expect(result.ok).toBe(true);
+      expect(result.verification_results).toHaveLength(1);
+      expect(result.verification_results[0].status).toBe("pass");
+    } finally {
+      process.env.PATH = oldPath;
+      try {
+        rmSync(tmpDir, { recursive: true, force: true });
+      } catch (_err) {
+        // cleanup ignore
+      }
+    }
+  });
+
   it("supports symbol-only Lean verify specifications", () => {
     const tmpDir = mkdtempSync(path.join(tmpdir(), "cosheaf-lean-sym-"));
     const binDir = path.join(tmpDir, "bin");

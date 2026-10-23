@@ -1369,11 +1369,22 @@ export function verifyLocalWorkspace(options = {}) {
             continue;
           }
           try {
-            const res = spawnSync("lean", [resolvedFilePath], {
-              cwd: rootDir,
-              encoding: "utf8",
-              timeout: timeoutMs,
-            });
+            const hasLake =
+              (existsSync(path.join(rootDir, "lakefile.lean")) ||
+                existsSync(path.join(rootDir, "lakefile.toml"))) &&
+              isBinaryAvailable("lake");
+
+            const res = hasLake
+              ? spawnSync("lake", ["env", "lean", resolvedFilePath], {
+                  cwd: rootDir,
+                  encoding: "utf8",
+                  timeout: timeoutMs,
+                })
+              : spawnSync("lean", [resolvedFilePath], {
+                  cwd: rootDir,
+                  encoding: "utf8",
+                  timeout: timeoutMs,
+                });
             if (res.error) {
               if (res.error.code === "ENOENT") {
                 verification_results.push({
