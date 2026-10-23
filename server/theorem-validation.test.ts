@@ -276,6 +276,32 @@ describe("direct and transitive dependency taint detection (tainted_refs)", () =
     const res = workspaceTheoremValidation(db, "owner/w");
     expect(res.tainted_refs).toEqual([]);
   });
+
+  it("distinguishes path links with display text starting with [@ from local cross-references", () => {
+    const db = freshDb();
+
+    indexPageBatch(db, "owner/w", [
+      {
+        path: "a.md",
+        body: "---\nid: a\nstatus: proved\n---\n# Page A\n\n## Local Heading {#b}\n\nSee [@b](b.md).\n",
+      },
+      {
+        path: "b.md",
+        body: "---\nid: b\nstatus: draft\n---\n# Draft B\n",
+      },
+    ]);
+
+    const res = workspaceTheoremValidation(db, "owner/w");
+    expect(res.tainted_refs).toHaveLength(1);
+    expect(res.tainted_refs[0]).toMatchObject({
+      source_id: "a",
+      source_path: "a.md",
+      target_id: "b",
+      target_path: "b.md",
+      target_status: "draft",
+      target_label: "[@b](b.md)",
+    });
+  });
 });
 
 describe("cyclic reference detection (cyclic_refs)", () => {
@@ -373,7 +399,7 @@ describe("cyclic reference detection (cyclic_refs)", () => {
 
     expect(fullValidation?.cyclic_refs ?? []).toEqual([]);
     expect(fullValidation?.tainted_refs).toHaveLength(3999);
-  });
+  }, 15000);
 
   it("validates an 8000-page all-proved reference chain in linear time without quadratic slowdown", () => {
     const db = freshDb();

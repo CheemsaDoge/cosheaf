@@ -129,7 +129,7 @@ export function workspaceTheoremValidation(
   ): (typeof docs)[number] | null {
     if (
       srcDoc &&
-      link.target_label.startsWith("[@") &&
+      /^\[@[^[\]\r\n]+\]$/.test(link.target_label.trim()) &&
       localXrefsByPath.get(srcDoc.forgejo_id)?.has(link.target_id) === true
     ) {
       return srcDoc;
