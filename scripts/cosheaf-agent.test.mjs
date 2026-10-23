@@ -1,3 +1,7 @@
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import process from "node:process";
 import { describe, expect, it } from "vitest";
 import {
   loadPrFiles,
@@ -6,6 +10,7 @@ import {
   parseWorkspace,
   prFromFiles,
   tokenFromOptions,
+  verifyLocalWorkspace,
 } from "./cosheaf-agent.mjs";
 
 describe("cosheaf-agent", () => {
@@ -70,5 +75,181 @@ describe("cosheaf-agent", () => {
       title: "Update notes",
       files: [{ path: "notes/a.md", localPath: "docs/AI_CLIENTS.md" }],
     });
+  });
+});
+
+describe("verifyLocalWorkspace", () => {
+  it("detects Coflat markdown path links and cross-file theorem block refs to draft pages while ignoring escaped refs", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "cosheaf-test-co-"));
+    try {
+      writeFileSync(
+        path.join(dir, "pending.md"),
+        `---
+id: pending-doc
+status: draft
+---
+# Pending
+
+::: {#thm:pending .theorem}
+Draft theorem.
+:::
+`,
+        "utf8",
+      );
+      writeFileSync(
+        path.join(dir, "via-path.md"),
+        `---
+id: via-path
+status: proved
+---
+# Via Path
+
+See [Pending](pending.md).
+`,
+        "utf8",
+      );
+      writeFileSync(
+        path.join(dir, "via-xref.md"),
+        `---
+id: via-xref
+status: proved
+---
+# Via Xref
+
+By [@thm:pending], we have the bound.
+`,
+        "utf8",
+      );
+      writeFileSync(
+        path.join(dir, "escaped.md"),
+        `---
+id: escaped
+status: proved
+---
+# Escaped
+
+Escaped \\[@pending-doc] and inline code \`[@thm:pending]\`.
+`,
+        "utf8",
+      );
+
+      const result = verifyLocalWorkspace({ dir });
+      expect(result.ok).toBe(false);
+      expect(
+        result.tainted_refs.some(
+          (t) =>
+            t.source_path === "via-path.md" && t.target_path === "pending.md",
+        ),
+      ).toBe(true);
+      expect(
+        result.tainted_refs.some(
+          (t) =>
+            t.source_path === "via-xref.md" && t.target_path === "pending.md",
+        ),
+      ).toBe(true);
+      expect(
+        result.tainted_refs.some((t) => t.source_path === "escaped.md"),
+      ).toBe(false);
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch (_err) {
+        // cleanup ignore
+      }
+    }
+  });
+
+  it("fails SAT verification when kissat only prints banner and exits with code 1 under expect: sat", () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), "cosheaf-sat-"));
+    const binDir = path.join(tmpDir, "bin");
+    const workDir = path.join(tmpDir, "work");
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(workDir, { recursive: true });
+
+    const kissatScript = path.join(binDir, "kissat");
+    writeFileSync(
+      kissatScript,
+      `#!/bin/sh\nprintf 'c Kissat SAT Solver\\nc error: cannot read file\\n'\nexit 1\n`,
+      "utf8",
+    );
+    chmodSync(kissatScript, 0o755);
+
+    writeFileSync(
+      path.join(workDir, "doc.md"),
+      `---
+id: sat-test
+status: proved
+verify:
+  - kind: sat
+    file: test.cnf
+    expect: sat
+---
+# SAT Test
+`,
+      "utf8",
+    );
+    writeFileSync(path.join(workDir, "test.cnf"), "", "utf8");
+
+    const oldPath = process.env.PATH;
+    try {
+      process.env.PATH = `${binDir}:${oldPath}`;
+      const result = verifyLocalWorkspace({ dir: workDir });
+      expect(result.ok).toBe(false);
+      expect(result.verification_results[0].status).toBe("fail");
+    } finally {
+      process.env.PATH = oldPath;
+      try {
+        rmSync(tmpDir, { recursive: true, force: true });
+      } catch (_err) {
+        // cleanup ignore
+      }
+    }
+  });
+
+  it("fails SMT verification when z3 prints sat but exits with non-zero code under expect: sat", () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), "cosheaf-smt-"));
+    const binDir = path.join(tmpDir, "bin");
+    const workDir = path.join(tmpDir, "work");
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(workDir, { recursive: true });
+
+    const z3Script = path.join(binDir, "z3");
+    writeFileSync(
+      z3Script,
+      `#!/bin/sh\nprintf 'sat\\n(error "check failed")\\n'\nexit 1\n`,
+      "utf8",
+    );
+    chmodSync(z3Script, 0o755);
+
+    writeFileSync(
+      path.join(workDir, "doc.md"),
+      `---
+id: smt-test
+status: proved
+verify:
+  - kind: smt
+    file: test.smt2
+    expect: sat
+---
+# SMT Test
+`,
+      "utf8",
+    );
+    writeFileSync(path.join(workDir, "test.smt2"), "", "utf8");
+
+    const oldPath = process.env.PATH;
+    try {
+      process.env.PATH = `${binDir}:${oldPath}`;
+      const result = verifyLocalWorkspace({ dir: workDir });
+      expect(result.ok).toBe(false);
+      expect(result.verification_results[0].status).toBe("fail");
+    } finally {
+      process.env.PATH = oldPath;
+      try {
+        rmSync(tmpDir, { recursive: true, force: true });
+      } catch (_err) {
+        // cleanup ignore
+      }
+    }
   });
 });
