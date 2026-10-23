@@ -293,6 +293,94 @@ status: draft
     }
   });
 
+  it("falls through to ProbeInline verification when lake build fails with unknown target error for standalone Lean file", () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), "cosheaf-lean-unknown-target-"));
+    const binDir = path.join(tmpDir, "bin");
+    const workDir = path.join(tmpDir, "work");
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(path.join(workDir, "checks"), { recursive: true });
+
+    const leanScript = path.join(binDir, "lean");
+    writeFileSync(
+      leanScript,
+      `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  exit 0
+fi
+target="$1"
+if [ ! -f "$target" ]; then
+  exit 1
+fi
+if grep -Fq 'standaloneProof' "$target"; then
+  printf 'standaloneProof : True\\n'
+  exit 0
+else
+  exit 1
+fi
+`,
+      "utf8",
+    );
+    chmodSync(leanScript, 0o755);
+
+    const lakeScript = path.join(binDir, "lake");
+    writeFileSync(
+      lakeScript,
+      `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  exit 0
+fi
+if [ "$1" = "build" ]; then
+  printf "error: unknown target '%s'\\n" "$2" >&2
+  exit 1
+fi
+if [ "$1" = "env" ] && [ "$2" = "lean" ]; then
+  exec lean "$3"
+fi
+exit 1
+`,
+      "utf8",
+    );
+    chmodSync(lakeScript, 0o755);
+
+    writeFileSync(path.join(workDir, "lakefile.lean"), "-- lakefile\n", "utf8");
+    writeFileSync(
+      path.join(workDir, "checks", "Proof.lean"),
+      "def standaloneProof : True := True.intro\n",
+      "utf8",
+    );
+
+    writeFileSync(
+      path.join(workDir, "doc.md"),
+      `---
+id: standalone-lean-lake
+status: proved
+verify:
+  - kind: lean
+    file: checks/Proof.lean
+    symbol: standaloneProof
+---
+# Standalone Lean Test
+`,
+      "utf8",
+    );
+
+    const oldPath = process.env.PATH;
+    try {
+      process.env.PATH = `${binDir}:${oldPath}`;
+      const result = verifyLocalWorkspace({ dir: workDir });
+      expect(result.ok).toBe(true);
+      expect(result.verification_results).toHaveLength(1);
+      expect(result.verification_results[0].status).toBe("pass");
+    } finally {
+      process.env.PATH = oldPath;
+      try {
+        rmSync(tmpDir, { recursive: true, force: true });
+      } catch (_err) {
+        // cleanup ignore
+      }
+    }
+  });
+
   it("invokes lake env lean for file-only Lean verify specifications in a Lake project", () => {
     const tmpDir = mkdtempSync(path.join(tmpdir(), "cosheaf-lean-file-lake-"));
     const binDir = path.join(tmpDir, "bin");

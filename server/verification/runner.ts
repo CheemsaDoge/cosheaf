@@ -719,19 +719,26 @@ export function runVerifySpec(
             };
           }
           if (buildRes.status !== 0) {
-            return {
-              docPath,
-              kind: "lean",
-              status: "fail",
-              command: ["lake", "build", ...modules],
-              exitCode: buildRes.status,
-              durationMs: Date.now() - startTime,
-              message:
-                buildRes.stderr?.trim() ||
-                buildRes.stdout?.trim() ||
-                `Lake build failed with code ${buildRes.status}`,
-              alignment: "not_checked",
-            };
+            const buildMsg = `${buildRes.stderr || ""} ${buildRes.stdout || ""}`;
+            const isUnknownTarget =
+              /unknown (?:target|module|facet|package)|invalid target|no such target/i.test(
+                buildMsg,
+              );
+            if (!isUnknownTarget || files.length === 0) {
+              return {
+                docPath,
+                kind: "lean",
+                status: "fail",
+                command: ["lake", "build", ...modules],
+                exitCode: buildRes.status,
+                durationMs: Date.now() - startTime,
+                message:
+                  buildRes.stderr?.trim() ||
+                  buildRes.stdout?.trim() ||
+                  `Lake build failed with code ${buildRes.status}`,
+                alignment: "not_checked",
+              };
+            }
           }
         }
 

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type Database from "better-sqlite3";
@@ -742,6 +742,82 @@ describe("executable verifiers (runVerifySpec & verifyDocumentContent)", () => {
         symbol: "MyProject.main",
       });
       expect(res.status).toBe("pass");
+    } finally {
+      process.env.PATH = originalPath;
+      try {
+        rmSync(tmpDir, { recursive: true, force: true });
+      } catch (_err) {
+        // cleanup ignore
+      }
+      try {
+        rmSync(binDir, { recursive: true, force: true });
+      } catch (_err) {
+        // cleanup ignore
+      }
+    }
+  });
+
+  it("falls through to ProbeInline verification when lake build fails with unknown target error for standalone Lean file", () => {
+    const tmpDir = mkdtempSync(
+      path.join(tmpdir(), "cosheaf-lake-unknown-target-test-"),
+    );
+    const binDir = mkdtempSync(path.join(tmpdir(), "cosheaf-lake-bin-"));
+    const originalPath = process.env.PATH;
+
+    try {
+      mkdirSync(path.join(tmpDir, "checks"), { recursive: true });
+      writeFileSync(path.join(tmpDir, "lakefile.toml"), 'name = "test"\n', "utf8");
+      const proofLean = path.join(tmpDir, "checks", "Proof.lean");
+      writeFileSync(
+        proofLean,
+        "def standaloneProof : True := True.intro\n",
+        "utf8",
+      );
+
+      const whichBin = path.join(binDir, "which");
+      writeFileSync(whichBin, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+      const leanBin = path.join(binDir, "lean");
+      const leanScript = [
+        "#!/bin/sh",
+        'file="$1"',
+        'if [ -f "$file" ] && grep -q "standaloneProof" "$file"; then',
+        '  printf "standaloneProof : True\\n"',
+        "  exit 0",
+        "else",
+        '  printf "unknown identifier \'standaloneProof\'\\n" >&2',
+        "  exit 1",
+        "fi",
+        "",
+      ].join("\n");
+      writeFileSync(leanBin, leanScript, { mode: 0o755 });
+
+      const lakeBin = path.join(binDir, "lake");
+      const lakeScript = [
+        "#!/bin/sh",
+        'if [ "$1" = "build" ]; then',
+        '  printf "error: unknown target \'%s\'\\n" "$2" >&2',
+        "  exit 1",
+        "fi",
+        'if [ "$1" = "env" ]; then',
+        "  shift",
+        '  exec "$@"',
+        "fi",
+        "exit 0",
+        "",
+      ].join("\n");
+      writeFileSync(lakeBin, lakeScript, { mode: 0o755 });
+
+      process.env.PATH = `${binDir}:${originalPath ?? ""}`;
+
+      const res = runVerifySpec(tmpDir, "doc.md", {
+        kind: "lean",
+        file: "checks/Proof.lean",
+        symbol: "standaloneProof",
+      });
+
+      expect(res.status).toBe("pass");
+      expect(res.message).toContain("standaloneProof");
     } finally {
       process.env.PATH = originalPath;
       try {

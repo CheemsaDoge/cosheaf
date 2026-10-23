@@ -1294,15 +1294,22 @@ export function verifyLocalWorkspace(options = {}) {
                 }
                 continue;
               } else if (buildRes.status !== 0) {
-                const errMsg = (buildRes.stderr || buildRes.stdout || `Lake build failed with code ${buildRes.status}`).trim().split("\n")[0];
-                verification_results.push({
-                  docPath: doc.relPath,
-                  kind: "lean",
-                  status: "fail",
-                  message: errMsg || `Lake build failed with code ${buildRes.status}`,
-                  alignment: "not_checked",
-                });
-                continue;
+                const buildMsg = `${buildRes.stderr || ""} ${buildRes.stdout || ""}`;
+                const isUnknownTarget =
+                  /unknown (?:target|module|facet|package)|invalid target|no such target/i.test(
+                    buildMsg,
+                  );
+                if (!isUnknownTarget || files.length === 0) {
+                  const errMsg = (buildRes.stderr || buildRes.stdout || `Lake build failed with code ${buildRes.status}`).trim().split("\n")[0];
+                  verification_results.push({
+                    docPath: doc.relPath,
+                    kind: "lean",
+                    status: "fail",
+                    message: errMsg || `Lake build failed with code ${buildRes.status}`,
+                    alignment: "not_checked",
+                  });
+                  continue;
+                }
               }
             }
 
