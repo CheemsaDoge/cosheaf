@@ -1,9 +1,15 @@
 #!/usr/bin/env node
 
+import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
 import process from "node:process";
+import {
+  buildReferenceCatalog,
+  extractDocumentReferences,
+  parseFrontmatter as parseCoflatFrontmatter,
+  resolveMarkdownReferencePathFromDocument,
+} from "@chaoxu/coflat/parse";
 import { Command } from "commander";
 import { parse as parseYaml } from "yaml";
 import { defaultApiUrl, loadDotenvDev } from "./lib/env-dev.mjs";
@@ -284,26 +290,6 @@ function extractFrontmatterAndBody(content) {
   return { frontmatter: {}, body: content };
 }
 
-function extractBracketedRefs(body) {
-  const stripped = body
-    .replace(/```[\s\S]*?```/g, "")
-    .replace(/~~~[\s\S]*?~~~/g, "")
-    .replace(/`[^`\n]*`/g, "");
-
-  const refs = [];
-  const bracketRegex = /\[([^\]\n]+)\]/g;
-  let match;
-  while ((match = bracketRegex.exec(stripped)) !== null) {
-    const inner = match[1];
-    const atRegex = /(?:^|[\s;,(-])@([A-Za-z0-9_][\w:./'-]*)/g;
-    let atMatch;
-    while ((atMatch = atRegex.exec(inner)) !== null) {
-      refs.push(atMatch[1]);
-    }
-  }
-  return refs;
-}
-
 function normalizeTheoremStatus(raw) {
   if (typeof raw !== "string") return "proved";
   const s = raw.trim().toLowerCase();
@@ -362,11 +348,25 @@ export function verifyLocalWorkspace(options = {}) {
     } catch (_readError) {
       continue;
     }
-    const { frontmatter, body } = extractFrontmatterAndBody(content);
+    let frontmatter = {};
+    let body = content;
+    const coflatParsed = parseCoflatFrontmatter(content);
+    if (coflatParsed.frontmatter !== null && typeof coflatParsed.frontmatter === "object") {
+      frontmatter = coflatParsed.frontmatter;
+      body = coflatParsed.body;
+    } else if (content.includes("---")) {
+      const fallback = extractFrontmatterAndBody(content);
+      frontmatter = fallback.frontmatter;
+      body = fallback.body;
+    }
     const id = typeof frontmatter.id === "string" && frontmatter.id.trim() ? frontmatter.id.trim() : null;
     const rawStatus = typeof frontmatter.status === "string" ? frontmatter.status.trim() : null;
     const status = normalizeTheoremStatus(rawStatus);
-    const refs = extractBracketedRefs(body);
+    const catalog = buildReferenceCatalog(content);
+    const targets = (catalog.targets || []).filter(
+      (t) => typeof t.id === "string" && t.id.trim().length > 0,
+    );
+    const links = extractDocumentReferences(content);
     const baseName = path.basename(relPath);
     const stem = path.basename(relPath, ".md");
     const relStem = relPath.replace(/\.md$/i, "");
@@ -382,12 +382,15 @@ export function verifyLocalWorkspace(options = {}) {
       status,
       frontmatter,
       body,
-      refs,
+      targets,
+      links,
     });
   }
 
   const docById = new Map();
   const docByPath = new Map();
+  const xrefCounts = new Map();
+  const docByXref = new Map();
 
   for (const doc of docs) {
     if (doc.id) {
@@ -395,36 +398,129 @@ export function verifyLocalWorkspace(options = {}) {
     }
     docByPath.set(doc.relPath, doc);
     if (!docByPath.has(doc.relStem)) docByPath.set(doc.relStem, doc);
-    if (!docByPath.has(doc.baseName)) docByPath.set(doc.baseName, doc);
-    if (!docByPath.has(doc.stem)) docByPath.set(doc.stem, doc);
+
+    for (const target of doc.targets) {
+      if (typeof target.id === "string" && target.id.trim()) {
+        const tid = target.id.trim();
+        const count = (xrefCounts.get(tid) ?? 0) + 1;
+        xrefCounts.set(tid, count);
+        if (count === 1) {
+          docByXref.set(tid, doc);
+        } else {
+          docByXref.delete(tid);
+        }
+      }
+    }
   }
 
-  function resolveTargetDoc(refKey) {
-    const cleanKey = refKey.split("#")[0].trim();
-    if (!cleanKey) return null;
-    return docById.get(cleanKey) || docByPath.get(cleanKey) || null;
+  function resolveLinkTargetDoc(srcDoc, link) {
+    if (!link || typeof link !== "object") return null;
+    if (link.kind === "id") {
+      const byId = docById.get(link.ref);
+      if (byId) return byId;
+      if (xrefCounts.get(link.ref) === 1) {
+        return docByXref.get(link.ref) ?? null;
+      }
+      return null;
+    }
+    if (link.kind === "path") {
+      const [linkPath] = String(link.ref ?? "").split("#", 1);
+      if (!linkPath) return null;
+      const resolved = resolveMarkdownReferencePathFromDocument(srcDoc.relPath, linkPath);
+      return docByPath.get(resolved) || docByPath.get(`${resolved}.md`) || null;
+    }
+    return null;
+  }
+
+  const adj = new Map();
+  for (const doc of docs) {
+    adj.set(doc.relPath, new Set());
+  }
+
+  for (const doc of docs) {
+    const neighbors = adj.get(doc.relPath);
+    for (const link of doc.links) {
+      const targetDoc = resolveLinkTargetDoc(doc, link);
+      if (targetDoc && targetDoc !== doc) {
+        neighbors.add(targetDoc.relPath);
+      }
+    }
+  }
+
+  function findNearestTainted(startDoc, originDoc) {
+    const queue = [{ relPath: startDoc.relPath, path: [startDoc.relPath] }];
+    const visited = new Set([startDoc.relPath, originDoc.relPath]);
+
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (!current) break;
+
+      const neighbors = Array.from(adj.get(current.relPath) ?? []).sort((a, b) =>
+        a.localeCompare(b),
+      );
+
+      for (const nextRelPath of neighbors) {
+        if (visited.has(nextRelPath)) continue;
+        visited.add(nextRelPath);
+
+        const nextDoc = docByPath.get(nextRelPath);
+        if (!nextDoc) continue;
+
+        const nextPath = [...current.path, nextDoc.relPath];
+        if (nextDoc.status !== "proved") {
+          return { targetDoc: nextDoc, viaPath: nextPath };
+        }
+
+        queue.push({ relPath: nextRelPath, path: nextPath });
+      }
+    }
+
+    return null;
   }
 
   const tainted_refs = [];
   const seenTaints = new Set();
 
-  for (const doc of docs) {
-    if (doc.status !== "proved") continue;
-    for (const refKey of doc.refs) {
-      const targetDoc = resolveTargetDoc(refKey);
-      if (!targetDoc || targetDoc === doc) continue;
-      if (targetDoc.status !== "proved") {
-        const taintKey = `${doc.relPath}->${targetDoc.relPath}`;
+  for (const srcDoc of docs) {
+    if (srcDoc.status !== "proved") continue;
+    for (const link of srcDoc.links) {
+      const directDoc = resolveLinkTargetDoc(srcDoc, link);
+      if (!directDoc || directDoc === srcDoc) continue;
+
+      if (directDoc.status !== "proved") {
+        const taintKey = `${srcDoc.relPath}->${directDoc.relPath}:${link.raw}:${link.line ?? ""}`;
         if (!seenTaints.has(taintKey)) {
           seenTaints.add(taintKey);
           tainted_refs.push({
-            source_path: doc.relPath,
-            source_id: doc.id,
-            target_path: targetDoc.relPath,
-            target_id: targetDoc.id ?? refKey,
-            target_status: targetDoc.rawStatus || targetDoc.status,
-            ref: refKey,
+            source_path: srcDoc.relPath,
+            source_id: srcDoc.id,
+            target_path: directDoc.relPath,
+            target_id: directDoc.id ?? (link.kind === "id" ? link.ref : directDoc.relPath),
+            target_status: directDoc.rawStatus || directDoc.status,
+            ref: link.ref,
+            target_label: link.raw,
+            line: link.line ?? null,
           });
+        }
+      } else {
+        const tainted = findNearestTainted(directDoc, srcDoc);
+        if (tainted) {
+          const targetDoc = tainted.targetDoc;
+          const taintKey = `${srcDoc.relPath}->${targetDoc.relPath}:${link.raw}:${link.line ?? ""}`;
+          if (!seenTaints.has(taintKey)) {
+            seenTaints.add(taintKey);
+            tainted_refs.push({
+              source_path: srcDoc.relPath,
+              source_id: srcDoc.id,
+              target_path: targetDoc.relPath,
+              target_id: targetDoc.id ?? targetDoc.relPath,
+              target_status: targetDoc.rawStatus || targetDoc.status,
+              ref: link.ref,
+              target_label: link.raw,
+              line: link.line ?? null,
+              via_path: tainted.viaPath,
+            });
+          }
         }
       }
     }
@@ -588,14 +684,43 @@ export function verifyLocalWorkspace(options = {}) {
               });
             }
           } else {
-            const combined = `${res.stdout || ""}\n${res.stderr || ""}`.toLowerCase();
-            const outcome = combined.includes("unsat") || res.status === 20
-              ? "unsat"
-              : combined.includes("sat") || res.status === 10
-                ? "sat"
-                : "unknown";
+            let parsedLine = null;
+            for (const line of (res.stdout || "").split(/\r?\n/)) {
+              const trimmed = line.trim();
+              if (/^s\s+SATISFIABLE$/i.test(trimmed)) {
+                parsedLine = "sat";
+                break;
+              }
+              if (/^s\s+UNSATISFIABLE$/i.test(trimmed)) {
+                parsedLine = "unsat";
+                break;
+              }
+            }
+
+            let outcome = null;
+            if (res.status !== 0 && res.status !== 10 && res.status !== 20) {
+              outcome = null;
+            } else if (res.status === 10 && parsedLine !== "unsat") {
+              outcome = "sat";
+            } else if (res.status === 20 && parsedLine !== "sat") {
+              outcome = "unsat";
+            } else if (res.status === 0 && (parsedLine === "sat" || parsedLine === "unsat")) {
+              outcome = parsedLine;
+            } else {
+              outcome = null;
+            }
+
             const expected = typeof item.expect === "string" ? item.expect.toLowerCase() : null;
-            if (expected) {
+            if (!outcome) {
+              verification_results.push({
+                docPath: doc.relPath,
+                kind: "sat",
+                status: "fail",
+                message: res.status !== 0 && res.status !== 10 && res.status !== 20
+                  ? `SAT solver failed with exit code ${res.status}`
+                  : `SAT solver did not produce a definitive result (exit code ${res.status})`,
+              });
+            } else if (expected) {
               if (outcome === expected) {
                 verification_results.push({
                   docPath: doc.relPath,
@@ -611,19 +736,12 @@ export function verifyLocalWorkspace(options = {}) {
                   message: `SAT solver outcome '${outcome}' did not match expected '${expected}'`,
                 });
               }
-            } else if (outcome === "sat" || outcome === "unsat" || res.status === 0) {
+            } else {
               verification_results.push({
                 docPath: doc.relPath,
                 kind: "sat",
                 status: "pass",
                 message: `SAT solver completed (${outcome})`,
-              });
-            } else {
-              verification_results.push({
-                docPath: doc.relPath,
-                kind: "sat",
-                status: "fail",
-                message: `SAT solver failed with exit code ${res.status}`,
               });
             }
           }
@@ -693,46 +811,56 @@ export function verifyLocalWorkspace(options = {}) {
                 message: res.error.message,
               });
             }
+          } else if (res.status !== 0) {
+            const errMsg = (res.stderr || res.stdout || `SMT solver failed with exit code ${res.status}`).trim().split("\n")[0];
+            verification_results.push({
+              docPath: doc.relPath,
+              kind: "smt",
+              status: "fail",
+              message: errMsg || `SMT solver failed with exit code ${res.status}`,
+            });
           } else {
             let outcome = "unknown";
-            for (const line of `${res.stdout || ""}\n${res.stderr || ""}`.split(/\r?\n/)) {
+            for (const line of (res.stdout || "").split(/\r?\n/)) {
               const trimmed = line.trim().toLowerCase();
               if (trimmed === "sat" || trimmed === "unsat") {
                 outcome = trimmed;
                 break;
               }
             }
-            const expected = typeof item.expect === "string" ? item.expect.toLowerCase() : null;
-            if (expected) {
-              if (outcome === expected) {
-                verification_results.push({
-                  docPath: doc.relPath,
-                  kind: "smt",
-                  status: "pass",
-                  message: `SMT solver returned expected ${expected}`,
-                });
-              } else {
-                verification_results.push({
-                  docPath: doc.relPath,
-                  kind: "smt",
-                  status: "fail",
-                  message: `SMT solver outcome '${outcome}' did not match expected '${expected}'`,
-                });
-              }
-            } else if (outcome === "sat" || outcome === "unsat" || res.status === 0) {
-              verification_results.push({
-                docPath: doc.relPath,
-                kind: "smt",
-                status: "pass",
-                message: `SMT solver completed (${outcome})`,
-              });
-            } else {
+            if (outcome === "unknown") {
               verification_results.push({
                 docPath: doc.relPath,
                 kind: "smt",
                 status: "fail",
-                message: `SMT solver failed with exit code ${res.status}`,
+                message: "SMT solver did not return sat or unsat",
               });
+            } else {
+              const expected = typeof item.expect === "string" ? item.expect.toLowerCase() : null;
+              if (expected) {
+                if (outcome === expected) {
+                  verification_results.push({
+                    docPath: doc.relPath,
+                    kind: "smt",
+                    status: "pass",
+                    message: `SMT solver returned expected ${expected}`,
+                  });
+                } else {
+                  verification_results.push({
+                    docPath: doc.relPath,
+                    kind: "smt",
+                    status: "fail",
+                    message: `SMT solver outcome '${outcome}' did not match expected '${expected}'`,
+                  });
+                }
+              } else {
+                verification_results.push({
+                  docPath: doc.relPath,
+                  kind: "smt",
+                  status: "pass",
+                  message: `SMT solver completed (${outcome})`,
+                });
+              }
             }
           }
         } catch (error) {
