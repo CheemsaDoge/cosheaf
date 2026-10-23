@@ -1,10 +1,15 @@
 import { parse, stringify } from "yaml";
+import type { TheoremStatus, VerifySpec } from "./theorem-status.js";
+
+export type { TheoremStatus, VerifySpec };
 
 export interface Frontmatter {
   id?: string;
   title?: string;
   type?: string;
   target?: string;
+  status?: TheoremStatus | string | null;
+  verify?: VerifySpec[];
   tags?: string[];
   [key: string]: unknown;
 }
