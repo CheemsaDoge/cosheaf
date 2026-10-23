@@ -63,6 +63,11 @@ export function summarizeReconcileResults(results: ReconcileWorkspaceResult[]): 
   );
 }
 
+export function hasPendingStatusBackfill(db: Database.Database): boolean {
+  const row = db.prepare("SELECT 1 FROM doc_map WHERE status IS NULL LIMIT 1").get();
+  return Boolean(row);
+}
+
 export function startSidecarReconciler(options: {
   db: Database.Database;
   forgejo: Forgejo;
@@ -70,7 +75,6 @@ export function startSidecarReconciler(options: {
   log?: Pick<Console, "log" | "warn">;
 }): NodeJS.Timeout | null {
   const { db, forgejo, intervalMs, log = console } = options;
-  if (intervalMs <= 0) return null;
   let running = false;
   const runOnce = async (): Promise<void> => {
     if (running) {
@@ -94,6 +98,10 @@ export function startSidecarReconciler(options: {
       running = false;
     }
   };
+  if (hasPendingStatusBackfill(db)) {
+    void runOnce();
+  }
+  if (intervalMs <= 0) return null;
   const timer = setInterval(() => {
     void runOnce();
   }, intervalMs);

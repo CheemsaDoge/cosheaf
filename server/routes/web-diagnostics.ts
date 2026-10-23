@@ -1,13 +1,14 @@
 import type { Hono } from "hono";
-import type { AppEnv } from "../types.js";
-import { workspaceValidation } from "../workspace-validation.js";
 import type { WorkspaceValidation } from "../../shared/validation.js";
+import type { AppEnv } from "../types.js";
+import { ensureWorkspaceStatusesBackfilled, workspaceValidation } from "../workspace-validation.js";
 import { htmlResponse, repoHref, urlPath, webRoute } from "./web-context.js";
-import { emptyHtml, html, type Html } from "./web-html.js";
+import { emptyHtml, type Html, html } from "./web-html.js";
 import { repoPageShell } from "./web-page.js";
 
 export function registerDiagnosticsRoutes(web: Hono<AppEnv>): void {
   web.get("/:owner/:repo/diagnostics", webRoute(async (_c, ctx) => {
+    await ensureWorkspaceStatusesBackfilled(ctx.db, ctx.backend, ctx.owner, ctx.repo, ctx.ws.slug);
     const validation = workspaceValidation(ctx.db, ctx.ws.slug);
     return htmlResponse(
       repoPageShell(ctx, "diagnostics", `Diagnostics - ${ctx.repo}`, html`

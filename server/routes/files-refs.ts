@@ -24,7 +24,7 @@ import {
 import { getCachedTree, setCachedTree } from "../tree-cache.js";
 import type { AppEnv } from "../types.js";
 import { WorkspaceBackendError } from "../workspace-backend.js";
-import { workspaceValidation } from "../workspace-validation.js";
+import { ensureWorkspaceStatusesBackfilled, workspaceValidation } from "../workspace-validation.js";
 import { safeRel, validRequestedBranch } from "./files.js";
 import { parseBoundedPositiveInt } from "./query-params.js";
 import { bad } from "./responses.js";
@@ -181,8 +181,10 @@ export function registerFileRefRoutes(files: Hono<AppEnv>): void {
     return c.json({ backlinks: rows });
   });
 
-  files.get("/:owner/:repo/validation", (c) => {
+  files.get("/:owner/:repo/validation", async (c) => {
     const ws = c.get("workspace");
+    const { backend, owner, repo } = c.get("repoCtx");
+    await ensureWorkspaceStatusesBackfilled(c.get("db"), backend, owner, repo, ws.slug);
     return c.json(workspaceValidation(c.get("db"), ws.slug) satisfies WorkspaceValidation);
   });
 }

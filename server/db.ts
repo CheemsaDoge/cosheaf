@@ -402,7 +402,7 @@ function migrateAddDocMapStatus(db: Database.Database): void {
   const hasStatus = (db.prepare("PRAGMA table_info(doc_map)").all() as Array<{ name: string }>)
     .some((col) => col.name === "status");
   if (!hasStatus) {
-    db.exec("ALTER TABLE doc_map ADD COLUMN status TEXT NOT NULL DEFAULT 'proved'");
+    db.exec("ALTER TABLE doc_map ADD COLUMN status TEXT");
   }
 }
 
