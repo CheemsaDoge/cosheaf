@@ -19,7 +19,15 @@ import {
 } from "./workspace-validation.js";
 
 function freshDb(): Database.Database {
-  return freshTestDb("cosheaf-thm-");
+  const db = freshTestDb("cosheaf-thm-");
+  const retained: unknown[] = [];
+  const originalPrepare = db.prepare.bind(db);
+  db.prepare = ((source: string) => {
+    const stmt = originalPrepare(source);
+    retained.push(stmt);
+    return stmt;
+  }) as typeof db.prepare;
+  return db;
 }
 
 describe("normalizeTheoremStatus and parseVerifySpecs", () => {
@@ -214,6 +222,59 @@ describe("cyclic reference detection (cyclic_refs)", () => {
     const fullValidation = workspaceValidation(db, "owner/w");
     expect(fullValidation.cyclic_refs).toEqual(theoremValidation.cyclic_refs);
   });
+
+  it("handles a 4000-page acyclic reference chain without call stack overflow", () => {
+    const db = freshDb();
+    const count = 4000;
+
+    const insertDoc = db.prepare(
+      `INSERT INTO doc_map (workspace_slug, cosheaf_id, forgejo_id, title, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+    const insertBacklink = db.prepare(
+      `INSERT INTO backlinks (workspace_slug, src_id, src_path, target_id, target_label, line)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+
+    const seedChain = db.transaction(() => {
+      for (let i = 0; i < count; i++) {
+        const id = `page-${String(i).padStart(4, "0")}`;
+        const pagePath = `${id}.md`;
+        const status = i === count - 1 ? "draft" : "proved";
+        insertDoc.run("owner/w", id, pagePath, `Page ${i}`, status, 1700000000);
+
+        if (i < count - 1) {
+          const nextId = `page-${String(i + 1).padStart(4, "0")}`;
+          insertBacklink.run(
+            "owner/w",
+            id,
+            pagePath,
+            nextId,
+            `[@${nextId}]`,
+            1,
+          );
+        }
+      }
+    });
+
+    seedChain();
+
+    let theoremValidation: ReturnType<typeof workspaceTheoremValidation> | undefined;
+    expect(() => {
+      theoremValidation = workspaceTheoremValidation(db, "owner/w");
+    }).not.toThrow();
+
+    expect(theoremValidation?.cyclic_refs).toEqual([]);
+    expect(theoremValidation?.tainted_refs).toHaveLength(3999);
+
+    let fullValidation: ReturnType<typeof workspaceValidation> | undefined;
+    expect(() => {
+      fullValidation = workspaceValidation(db, "owner/w");
+    }).not.toThrow();
+
+    expect(fullValidation?.cyclic_refs ?? []).toEqual([]);
+    expect(fullValidation?.tainted_refs).toHaveLength(3999);
+  });
 });
 
 describe("executable verifiers (runVerifySpec & verifyDocumentContent)", () => {
@@ -293,6 +354,56 @@ describe("executable verifiers (runVerifySpec & verifyDocumentContent)", () => {
       });
       expect(["skipped", "pass", "fail"]).toContain(leanSymbolResult.status);
     } finally {
+      try {
+        rmSync(tmpDir, { recursive: true, force: true });
+      } catch (_err) {
+        // cleanup ignore
+      }
+    }
+  });
+
+  it("rejects SAT banner false positives and non-zero solver exit codes", () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), "cosheaf-solver-test-"));
+    const originalPath = process.env.PATH;
+
+    try {
+      const kissatBin = path.join(tmpDir, "kissat");
+      writeFileSync(
+        kissatBin,
+        '#!/bin/sh\nprintf "c Kissat SAT Solver\\nc error: invalid input\\n"\nexit 1\n',
+        { mode: 0o755 },
+      );
+
+      const z3Bin = path.join(tmpDir, "z3");
+      writeFileSync(
+        z3Bin,
+        '#!/bin/sh\nprintf "sat\\n(error \\"failed\\")\\n"\nexit 1\n',
+        { mode: 0o755 },
+      );
+
+      const badCnf = path.join(tmpDir, "bad.cnf");
+      writeFileSync(badCnf, "p cnf 1 1\n1 0\n", "utf8");
+
+      const badSmt2 = path.join(tmpDir, "bad.smt2");
+      writeFileSync(badSmt2, "(check-sat)\n", "utf8");
+
+      process.env.PATH = `${tmpDir}${path.delimiter}${originalPath ?? ""}`;
+
+      const satResult = runVerifySpec(tmpDir, "doc.md", {
+        kind: "sat",
+        file: "bad.cnf",
+        expect: "sat",
+      });
+      expect(satResult.status).toBe("fail");
+
+      const smtResult = runVerifySpec(tmpDir, "doc.md", {
+        kind: "smt",
+        file: "bad.smt2",
+        expect: "sat",
+      });
+      expect(smtResult.status).toBe("fail");
+    } finally {
+      process.env.PATH = originalPath;
       try {
         rmSync(tmpDir, { recursive: true, force: true });
       } catch (_err) {
