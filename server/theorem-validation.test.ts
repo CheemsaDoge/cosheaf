@@ -209,6 +209,60 @@ describe("direct and transitive dependency taint detection (tainted_refs)", () =
     expect(res.tainted_refs?.[0]?.target_path).toBe("b.md");
   });
 
+  it("treats NULL status in doc_map as draft (unverified) during backfill failure or before backfill", async () => {
+    const db = freshDb();
+
+    indexPageBatch(db, "owner/w", [
+      {
+        path: "a.md",
+        body: "---\nid: a\nstatus: proved\n---\n# A\n\nSee [@b].\n",
+      },
+      {
+        path: "b.md",
+        body: "---\nid: b\nstatus: draft\n---\n# B\n",
+      },
+    ]);
+
+    db.prepare(
+      "UPDATE doc_map SET status = NULL WHERE workspace_slug = 'owner/w' AND cosheaf_id = 'b'",
+    ).run();
+
+    // Mock backend where getRawFile fails (e.g. upstream outage)
+    const backend = {
+      getRawFile: async (_o: string, _r: string, _ref: string, _p: string) => {
+        throw new Error("Upstream outage reading raw file");
+      },
+    };
+
+    // ensureWorkspaceStatusesBackfilled catches errors and leaves status NULL in doc_map
+    await ensureWorkspaceStatusesBackfilled(
+      db,
+      backend,
+      "owner",
+      "w",
+      "owner/w",
+    );
+
+    // Verify doc_map status is still NULL
+    const rowB = db
+      .prepare(
+        "SELECT status FROM doc_map WHERE workspace_slug = 'owner/w' AND cosheaf_id = 'b'",
+      )
+      .get() as { status: string | null } | undefined;
+    expect(rowB?.status).toBeNull();
+
+    // workspaceTheoremValidation/workspaceValidation must treat NULL status as draft and flag the reference as tainted
+    const res = workspaceTheoremValidation(db, "owner/w");
+    expect(res.tainted_refs).toHaveLength(1);
+    expect(res.tainted_refs[0]).toMatchObject({
+      source_id: "a",
+      source_path: "a.md",
+      target_id: "b",
+      target_path: "b.md",
+      target_status: "draft",
+    });
+  });
+
   it("does not overwrite freshly indexed status if concurrent reindex completes during backfill", async () => {
     const db = freshDb();
 

@@ -58,7 +58,7 @@ export function workspaceTheoremValidation(
 ): { tainted_refs: TaintedReference[]; cyclic_refs: CyclicReference[] } {
   const docs = db
     .prepare(
-      `SELECT cosheaf_id, forgejo_id, title, COALESCE(status, 'proved') AS status
+      `SELECT cosheaf_id, forgejo_id, title, COALESCE(status, 'draft') AS status
          FROM doc_map
         WHERE workspace_slug = ?`,
     )
