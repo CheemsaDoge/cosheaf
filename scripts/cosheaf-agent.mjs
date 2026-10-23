@@ -336,6 +336,147 @@ function isBinaryAvailable(cmd) {
   }
 }
 
+export const LEAN_PRELUDE_NAMESPACES = new Set([
+  "Nat",
+  "Int",
+  "Bool",
+  "List",
+  "String",
+  "Char",
+  "Array",
+  "Option",
+  "Prod",
+  "Sum",
+  "Subtype",
+  "Sigma",
+  "Fin",
+  "BitVec",
+  "UInt8",
+  "UInt16",
+  "UInt32",
+  "UInt64",
+  "USize",
+  "Float",
+  "IO",
+  "Task",
+  "Except",
+  "EStateM",
+  "StateT",
+  "ReaderT",
+  "Id",
+  "Classical",
+  "Function",
+  "Decidable",
+  "Eq",
+  "Iff",
+  "And",
+  "Or",
+  "Not",
+  "Exists",
+  "True",
+  "False",
+  "Empty",
+  "Unit",
+  "PUnit",
+  "ULift",
+  "PLift",
+  "Lean",
+  "Std",
+]);
+
+const LEAN_SKIP_DIRS = new Set([".git", ".lake", "node_modules", "dist", ".cosheaf"]);
+
+export function resolveWorkspaceLeanModules(rootDir, symbol, explicitFilePath) {
+  const matchedModules = new Set();
+  const matchedFiles = new Set();
+
+  if (explicitFilePath) {
+    const resolved = path.isAbsolute(explicitFilePath)
+      ? explicitFilePath
+      : path.resolve(rootDir, explicitFilePath);
+    if (existsSync(resolved)) {
+      const absPath = path.resolve(resolved);
+      matchedFiles.add(absPath);
+      const rel = path.relative(rootDir, absPath).split(path.sep).join("/");
+      if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
+        const mod = rel.replace(/\.lean$/i, "").split("/").join(".");
+        if (mod) {
+          matchedModules.add(mod);
+        }
+      }
+    }
+  }
+
+  const leanFiles = [];
+  function walk(currentDir) {
+    let entries;
+    try {
+      entries = readdirSync(currentDir, { withFileTypes: true });
+    } catch (_scanErr) {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        if (!LEAN_SKIP_DIRS.has(entry.name)) {
+          walk(path.join(currentDir, entry.name));
+        }
+      } else if (entry.isFile() && entry.name.endsWith(".lean")) {
+        leanFiles.push(path.join(currentDir, entry.name));
+      }
+    }
+  }
+  walk(rootDir);
+
+  const sym = typeof symbol === "string" ? symbol.trim() : "";
+  const hasDot = sym.includes(".");
+  const shortName = hasDot ? sym.split(".").pop() : sym;
+  const defPattern = shortName
+    ? new RegExp(
+        `\\b(?:theorem|lemma|def|abbrev|inductive|structure|class|instance|axiom|opaque)\\s+${shortName.replace(/[$()*+?.[\\]^{|}]/g, "\\$&")}\\b`,
+      )
+    : null;
+
+  for (const fullLeanPath of leanFiles) {
+    const relPath = path.relative(rootDir, fullLeanPath).split(path.sep).join("/");
+    const modName = relPath.replace(/\.lean$/i, "").split("/").join(".");
+
+    let matched = false;
+    if (hasDot && (sym === modName || sym.startsWith(`${modName}.`))) {
+      matched = true;
+    }
+    if (!matched && shortName) {
+      try {
+        const content = readFileSync(fullLeanPath, "utf8");
+        if ((defPattern && defPattern.test(content)) || (sym && content.includes(sym))) {
+          matched = true;
+        }
+      } catch (_readErr) {
+        // ignore read error
+      }
+    }
+
+    if (matched) {
+      matchedModules.add(modName);
+      matchedFiles.add(fullLeanPath);
+    }
+  }
+
+  if (matchedModules.size === 0 && hasDot) {
+    const rootNs = sym.split(".")[0];
+    if (!LEAN_PRELUDE_NAMESPACES.has(rootNs)) {
+      const parentMod = sym.split(".").slice(0, -1).join(".");
+      if (parentMod) {
+        matchedModules.add(parentMod);
+      }
+    }
+  }
+
+  return {
+    modules: Array.from(matchedModules).sort((a, b) => a.localeCompare(b)),
+    files: Array.from(matchedFiles).sort((a, b) => a.localeCompare(b)),
+  };
+}
+
 export function verifyLocalWorkspace(options = {}) {
   const rootDir = path.resolve(options.dir ?? process.cwd());
   if (!existsSync(rootDir)) {
@@ -352,6 +493,7 @@ export function verifyLocalWorkspace(options = {}) {
         },
       ],
       tainted_refs: [],
+      cyclic_refs: [],
     };
   }
 
@@ -372,6 +514,7 @@ export function verifyLocalWorkspace(options = {}) {
         },
       ],
       tainted_refs: [],
+      cyclic_refs: [],
     };
   }
   if (!rootStat.isDirectory()) {
@@ -388,6 +531,7 @@ export function verifyLocalWorkspace(options = {}) {
         },
       ],
       tainted_refs: [],
+      cyclic_refs: [],
     };
   }
 
@@ -617,6 +761,101 @@ export function verifyLocalWorkspace(options = {}) {
       }
     }
   }
+
+  const indices = new Map();
+  const lowlink = new Map();
+  const onStack = new Map();
+  let index = 0;
+  const stack = [];
+  const sccs = [];
+
+  const sortedDocPaths = docs
+    .slice()
+    .sort((a, b) => a.relPath.localeCompare(b.relPath))
+    .map((d) => d.relPath);
+
+  for (const rootPath of sortedDocPaths) {
+    if (!indices.has(rootPath)) {
+      indices.set(rootPath, index);
+      lowlink.set(rootPath, index);
+      index += 1;
+      stack.push(rootPath);
+      onStack.set(rootPath, true);
+
+      const callStack = [
+        {
+          nodeId: rootPath,
+          neighbors: sortedAdj.get(rootPath) ?? [],
+          neighborIndex: 0,
+        },
+      ];
+
+      while (callStack.length > 0) {
+        const frame = callStack[callStack.length - 1];
+        if (frame === undefined) break;
+
+        if (frame.neighborIndex < frame.neighbors.length) {
+          const w = frame.neighbors[frame.neighborIndex];
+          frame.neighborIndex += 1;
+          if (w === undefined) continue;
+
+          if (!indices.has(w)) {
+            indices.set(w, index);
+            lowlink.set(w, index);
+            index += 1;
+            stack.push(w);
+            onStack.set(w, true);
+            callStack.push({
+              nodeId: w,
+              neighbors: sortedAdj.get(w) ?? [],
+              neighborIndex: 0,
+            });
+          } else if (onStack.get(w) === true) {
+            const currentLow = lowlink.get(frame.nodeId) ?? 0;
+            const neighborIndex = indices.get(w) ?? 0;
+            lowlink.set(frame.nodeId, Math.min(currentLow, neighborIndex));
+          }
+        } else {
+          callStack.pop();
+          if (callStack.length > 0) {
+            const parentFrame = callStack[callStack.length - 1];
+            if (parentFrame !== undefined) {
+              const parentLow = lowlink.get(parentFrame.nodeId) ?? 0;
+              const frameLow = lowlink.get(frame.nodeId) ?? 0;
+              lowlink.set(parentFrame.nodeId, Math.min(parentLow, frameLow));
+            }
+          }
+          if (lowlink.get(frame.nodeId) === indices.get(frame.nodeId)) {
+            const scc = [];
+            while (true) {
+              const popped = stack.pop();
+              if (popped === undefined) break;
+              onStack.set(popped, false);
+              scc.push(popped);
+              if (popped === frame.nodeId) break;
+            }
+            sccs.push(scc);
+          }
+        }
+      }
+    }
+  }
+
+  const cyclic_refs = [];
+  for (const scc of sccs) {
+    if (scc.length > 1) {
+      const sccDocs = scc
+        .map((p) => docByPath.get(p))
+        .filter((d) => d !== undefined)
+        .sort((a, b) => a.relPath.localeCompare(b.relPath));
+      cyclic_refs.push({
+        cycle_ids: sccDocs.map((d) => d.id ?? d.relPath),
+        cycle_paths: sccDocs.map((d) => d.relPath),
+      });
+    }
+  }
+
+  cyclic_refs.sort((a, b) => (a.cycle_paths[0] ?? "").localeCompare(b.cycle_paths[0] ?? ""));
 
   for (const doc of docs) {
     if (!Array.isArray(doc.frontmatter.verify)) continue;
@@ -973,6 +1212,7 @@ export function verifyLocalWorkspace(options = {}) {
           });
           continue;
         }
+        let resolvedFilePath = null;
         if (file) {
           let filePath = path.isAbsolute(file) ? file : path.resolve(rootDir, file);
           if (!existsSync(filePath)) {
@@ -990,62 +1230,9 @@ export function verifyLocalWorkspace(options = {}) {
             });
             continue;
           }
-          if (!isBinaryAvailable("lean")) {
-            verification_results.push({
-              docPath: doc.relPath,
-              kind: "lean",
-              status: "skipped",
-              message: "lean is not installed or not in PATH",
-            });
-            continue;
-          }
-          try {
-            const res = spawnSync("lean", [filePath], {
-              cwd: rootDir,
-              encoding: "utf8",
-              timeout: timeoutMs,
-            });
-            if (res.error) {
-              if (res.error.code === "ENOENT") {
-                verification_results.push({
-                  docPath: doc.relPath,
-                  kind: "lean",
-                  status: "skipped",
-                  message: "lean is not installed",
-                });
-              } else {
-                verification_results.push({
-                  docPath: doc.relPath,
-                  kind: "lean",
-                  status: "fail",
-                  message: res.error.message,
-                });
-              }
-            } else if (res.status === 0) {
-              verification_results.push({
-                docPath: doc.relPath,
-                kind: "lean",
-                status: "pass",
-                message: "Lean verification succeeded",
-              });
-            } else {
-              const errMsg = (res.stderr || res.stdout || `Lean exited with code ${res.status}`).trim().split("\n")[0];
-              verification_results.push({
-                docPath: doc.relPath,
-                kind: "lean",
-                status: "fail",
-                message: errMsg || `Lean exited with code ${res.status}`,
-              });
-            }
-          } catch (error) {
-            verification_results.push({
-              docPath: doc.relPath,
-              kind: "lean",
-              status: "fail",
-              message: error instanceof Error ? error.message : String(error),
-            });
-          }
-        } else {
+          resolvedFilePath = filePath;
+        }
+        if (symbol) {
           if (!/^[A-Za-z_][\w.']*$/.test(symbol)) {
             verification_results.push({
               docPath: doc.relPath,
@@ -1069,13 +1256,55 @@ export function verifyLocalWorkspace(options = {}) {
           let tmpDir = null;
           try {
             tmpDir = mkdtempSync(path.join(tmpdir(), "lean-verify-"));
+            const { modules, files } = resolveWorkspaceLeanModules(rootDir, symbol, resolvedFilePath);
+            const importLines = modules.map((m) => `import ${m}`).join("\n");
             const probeFile = path.join(tmpDir, "Probe.lean");
-            writeFileSync(probeFile, `#check ${symbol}\n`, "utf8");
-            const res = spawnSync("lean", [probeFile], {
-              cwd: rootDir,
-              encoding: "utf8",
-              timeout: timeoutMs,
-            });
+            const probeContent = importLines ? `${importLines}\n\n#check ${symbol}\n` : `#check ${symbol}\n`;
+            writeFileSync(probeFile, probeContent, "utf8");
+
+            const hasLake =
+              (existsSync(path.join(rootDir, "lakefile.lean")) ||
+                existsSync(path.join(rootDir, "lakefile.toml"))) &&
+              isBinaryAvailable("lake");
+
+            let res = hasLake
+              ? spawnSync("lake", ["env", "lean", probeFile], {
+                  cwd: rootDir,
+                  env: { ...process.env, LEAN_SRC_PATH: rootDir },
+                  encoding: "utf8",
+                  timeout: timeoutMs,
+                })
+              : spawnSync("lean", [probeFile], {
+                  cwd: rootDir,
+                  env: { ...process.env, LEAN_SRC_PATH: rootDir },
+                  encoding: "utf8",
+                  timeout: timeoutMs,
+                });
+
+            if (res.status !== 0 && files.length > 0) {
+              const fileContents = [];
+              for (const f of files) {
+                try {
+                  fileContents.push(readFileSync(f, "utf8"));
+                } catch (_readErr) {
+                  // ignore read error
+                }
+              }
+              if (fileContents.length > 0) {
+                const probeInlineFile = path.join(tmpDir, "ProbeInline.lean");
+                writeFileSync(
+                  probeInlineFile,
+                  `${fileContents.join("\n\n")}\n\n#check ${symbol}\n`,
+                  "utf8",
+                );
+                res = spawnSync("lean", [probeInlineFile], {
+                  cwd: rootDir,
+                  encoding: "utf8",
+                  timeout: timeoutMs,
+                });
+              }
+            }
+
             if (res.error) {
               if (res.error.code === "ENOENT") {
                 verification_results.push({
@@ -1129,6 +1358,62 @@ export function verifyLocalWorkspace(options = {}) {
               }
             }
           }
+        } else {
+          if (!isBinaryAvailable("lean")) {
+            verification_results.push({
+              docPath: doc.relPath,
+              kind: "lean",
+              status: "skipped",
+              message: "lean is not installed or not in PATH",
+            });
+            continue;
+          }
+          try {
+            const res = spawnSync("lean", [resolvedFilePath], {
+              cwd: rootDir,
+              encoding: "utf8",
+              timeout: timeoutMs,
+            });
+            if (res.error) {
+              if (res.error.code === "ENOENT") {
+                verification_results.push({
+                  docPath: doc.relPath,
+                  kind: "lean",
+                  status: "skipped",
+                  message: "lean is not installed",
+                });
+              } else {
+                verification_results.push({
+                  docPath: doc.relPath,
+                  kind: "lean",
+                  status: "fail",
+                  message: res.error.message,
+                });
+              }
+            } else if (res.status === 0) {
+              verification_results.push({
+                docPath: doc.relPath,
+                kind: "lean",
+                status: "pass",
+                message: "Lean verification succeeded",
+              });
+            } else {
+              const errMsg = (res.stderr || res.stdout || `Lean exited with code ${res.status}`).trim().split("\n")[0];
+              verification_results.push({
+                docPath: doc.relPath,
+                kind: "lean",
+                status: "fail",
+                message: errMsg || `Lean exited with code ${res.status}`,
+              });
+            }
+          } catch (error) {
+            verification_results.push({
+              docPath: doc.relPath,
+              kind: "lean",
+              status: "fail",
+              message: error instanceof Error ? error.message : String(error),
+            });
+          }
         }
       } else {
         verification_results.push({
@@ -1144,7 +1429,7 @@ export function verifyLocalWorkspace(options = {}) {
   const hasFailures = verification_results.some(
     (r) => r.status === "fail" || r.status === "error"
   );
-  const ok = !hasFailures && tainted_refs.length === 0;
+  const ok = !hasFailures && tainted_refs.length === 0 && cyclic_refs.length === 0;
 
   return {
     ok,
@@ -1152,6 +1437,7 @@ export function verifyLocalWorkspace(options = {}) {
     checked_files: mdFilePaths.length,
     verification_results,
     tainted_refs,
+    cyclic_refs,
   };
 }
 
@@ -1179,6 +1465,9 @@ export function buildProgram() {
         }
         for (const t of result.tainted_refs) {
           console.log(`  [TAINTED] ${t.source_path} (proved) depends on ${t.target_path} (${t.target_status})`);
+        }
+        for (const c of result.cyclic_refs) {
+          console.log(`  [CYCLE] ${c.cycle_paths.join(" <-> ")}`);
         }
       }
       if (!result.ok) process.exitCode = 1;
