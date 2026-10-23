@@ -1,15 +1,49 @@
 import type Database from "better-sqlite3";
-import type { TheoremStatus } from "../shared/theorem-status.js";
+import { parseFrontmatterYaml } from "../shared/frontmatter-yaml.js";
+import {
+  normalizeTheoremStatus,
+  type TheoremStatus,
+} from "../shared/theorem-status.js";
 import type {
   CyclicReference,
   TaintedReference,
   WorkspaceValidation,
 } from "../shared/validation.js";
+import type { WorkspaceBackend } from "./workspace-backend.js";
 
 interface TarjanFrame {
   nodeId: string;
   neighbors: readonly string[];
   neighborIndex: number;
+}
+
+export async function ensureWorkspaceStatusesBackfilled(
+  db: Database.Database,
+  backend: Pick<WorkspaceBackend, "getRawFile">,
+  owner: string,
+  repo: string,
+  workspaceSlug: string,
+): Promise<void> {
+  const missing = db
+    .prepare(
+      "SELECT cosheaf_id, forgejo_id FROM doc_map WHERE workspace_slug = ? AND status IS NULL",
+    )
+    .all(workspaceSlug) as Array<{ cosheaf_id: string; forgejo_id: string }>;
+  if (missing.length === 0) return;
+
+  const updateStmt = db.prepare(
+    "UPDATE doc_map SET status = ? WHERE workspace_slug = ? AND cosheaf_id = ?",
+  );
+  for (const row of missing) {
+    try {
+      const raw = await backend.getRawFile(owner, repo, "main", row.forgejo_id);
+      const { frontmatter } = parseFrontmatterYaml(raw);
+      const status = normalizeTheoremStatus(frontmatter.status);
+      updateStmt.run(status, workspaceSlug, row.cosheaf_id);
+    } catch (_err) {
+      // Keep null if raw file cannot be read right now
+    }
+  }
 }
 
 export function workspaceTheoremValidation(
@@ -36,11 +70,35 @@ export function workspaceTheoremValidation(
     .prepare("SELECT target_id, source_path FROM xref_targets WHERE workspace_slug = ?")
     .all(workspaceSlug) as Array<{ target_id: string; source_path: string }>;
 
+  const sameFileDups = db
+    .prepare("SELECT target_id FROM xref_target_duplicates WHERE workspace_slug = ?")
+    .all(workspaceSlug) as Array<{ target_id: string }>;
+
+  const localXrefsByPath = new Map<string, Set<string>>();
+  for (const x of xrefs) {
+    let set = localXrefsByPath.get(x.source_path);
+    if (!set) {
+      set = new Set<string>();
+      localXrefsByPath.set(x.source_path, set);
+    }
+    set.add(x.target_id);
+  }
+
+  const duplicateXrefIds = new Set(sameFileDups.map((d) => d.target_id));
+  const xrefCounts = new Map<string, number>();
+  for (const x of xrefs) {
+    xrefCounts.set(x.target_id, (xrefCounts.get(x.target_id) ?? 0) + 1);
+  }
+
   const docByXref = new Map<string, (typeof docs)[number]>();
   for (const x of xrefs) {
-    const doc = docByPath.get(x.source_path);
-    if (doc) {
-      docByXref.set(x.target_id, doc);
+    if (duplicateXrefIds.has(x.target_id)) continue;
+    const count = xrefCounts.get(x.target_id) ?? 0;
+    if (count === 1) {
+      const doc = docByPath.get(x.source_path);
+      if (doc) {
+        docByXref.set(x.target_id, doc);
+      }
     }
   }
 
@@ -59,8 +117,18 @@ export function workspaceTheoremValidation(
     line: number | null;
   }>;
 
-  function resolveTargetDoc(targetId: string): (typeof docs)[number] | null {
-    return docById.get(targetId) ?? docByXref.get(targetId) ?? null;
+  function resolveTargetDoc(
+    srcDoc: (typeof docs)[number] | undefined,
+    link: (typeof links)[number],
+  ): (typeof docs)[number] | null {
+    if (
+      srcDoc &&
+      link.target_label.startsWith("[@") &&
+      localXrefsByPath.get(srcDoc.forgejo_id)?.has(link.target_id) === true
+    ) {
+      return srcDoc;
+    }
+    return docById.get(link.target_id) ?? docByXref.get(link.target_id) ?? null;
   }
 
   const adj = new Map<string, Set<string>>();
@@ -69,7 +137,7 @@ export function workspaceTheoremValidation(
   }
   for (const link of links) {
     const srcDoc = docById.get(link.src_id) ?? docByPath.get(link.src_path);
-    const targetDoc = resolveTargetDoc(link.target_id);
+    const targetDoc = resolveTargetDoc(srcDoc, link);
     if (srcDoc && targetDoc && srcDoc.cosheaf_id !== targetDoc.cosheaf_id) {
       let neighbors = adj.get(srcDoc.cosheaf_id);
       if (!neighbors) {
@@ -90,6 +158,70 @@ export function workspaceTheoremValidation(
         return pathA.localeCompare(pathB);
       }),
     );
+  }
+
+  const revAdj = new Map<string, string[]>();
+  for (const doc of docs) {
+    revAdj.set(doc.cosheaf_id, []);
+  }
+  for (const [nodeId, neighbors] of sortedAdj) {
+    for (const w of neighbors) {
+      let list = revAdj.get(w);
+      if (!list) {
+        list = [];
+        revAdj.set(w, list);
+      }
+      list.push(nodeId);
+    }
+  }
+
+  const unprovedDocs = docs
+    .filter((d) => d.status !== "proved")
+    .sort((a, b) => a.forgejo_id.localeCompare(b.forgejo_id));
+
+  const distToTaint = new Map<string, number>();
+  const nextHopToTaint = new Map<string, string>();
+  const nearestTaintDoc = new Map<string, (typeof docs)[number]>();
+
+  if (unprovedDocs.length > 0) {
+    const revQueue: string[] = [];
+    for (const u of unprovedDocs) {
+      revQueue.push(u.cosheaf_id);
+      distToTaint.set(u.cosheaf_id, 0);
+      nearestTaintDoc.set(u.cosheaf_id, u);
+    }
+
+    let rHead = 0;
+    while (rHead < revQueue.length) {
+      const curr = revQueue[rHead];
+      rHead += 1;
+      if (curr === undefined) continue;
+
+      const currDist = distToTaint.get(curr) ?? 0;
+      for (const prev of revAdj.get(curr) ?? []) {
+        if (!distToTaint.has(prev)) {
+          distToTaint.set(prev, currDist + 1);
+          revQueue.push(prev);
+        }
+      }
+    }
+
+    for (let i = unprovedDocs.length; i < revQueue.length; i++) {
+      const nodeId = revQueue[i];
+      if (nodeId === undefined) continue;
+      const targetDist = (distToTaint.get(nodeId) ?? 0) - 1;
+      const neighbors = sortedAdj.get(nodeId) ?? [];
+      for (const w of neighbors) {
+        if (distToTaint.get(w) === targetDist) {
+          nextHopToTaint.set(nodeId, w);
+          const target = nearestTaintDoc.get(w);
+          if (target) {
+            nearestTaintDoc.set(nodeId, target);
+          }
+          break;
+        }
+      }
+    }
   }
 
   const taintedRefs: TaintedReference[] = [];
@@ -143,7 +275,7 @@ export function workspaceTheoremValidation(
     const srcDoc = docById.get(link.src_id) ?? docByPath.get(link.src_path);
     if (!srcDoc || srcDoc.status !== "proved") continue;
 
-    const directDoc = resolveTargetDoc(link.target_id);
+    const directDoc = resolveTargetDoc(srcDoc, link);
     if (!directDoc || directDoc.cosheaf_id === srcDoc.cosheaf_id) continue;
 
     if (directDoc.status !== "proved") {
@@ -158,7 +290,43 @@ export function workspaceTheoremValidation(
         line: link.line,
       });
     } else {
-      const tainted = findNearestTainted(directDoc.cosheaf_id, srcDoc.cosheaf_id);
+      if (!nearestTaintDoc.has(directDoc.cosheaf_id)) {
+        continue;
+      }
+      const preTarget = nearestTaintDoc.get(directDoc.cosheaf_id);
+      let tainted: { targetDoc: (typeof docs)[number]; viaPath: string[] } | null = null;
+      if (preTarget) {
+        const viaPath: string[] = [];
+        let passThroughSrc = false;
+        let curr: string | undefined = directDoc.cosheaf_id;
+        const visitedInPath = new Set<string>();
+
+        while (curr !== undefined) {
+          if (curr === srcDoc.cosheaf_id) {
+            passThroughSrc = true;
+            break;
+          }
+          if (visitedInPath.has(curr)) {
+            passThroughSrc = true;
+            break;
+          }
+          visitedInPath.add(curr);
+          viaPath.push(docById.get(curr)?.forgejo_id ?? curr);
+          if (curr === preTarget.cosheaf_id) {
+            break;
+          }
+          curr = nextHopToTaint.get(curr);
+        }
+
+        if (!passThroughSrc && curr === preTarget.cosheaf_id) {
+          tainted = { targetDoc: preTarget, viaPath };
+        }
+      }
+
+      if (!tainted) {
+        tainted = findNearestTainted(directDoc.cosheaf_id, srcDoc.cosheaf_id);
+      }
+
       if (tainted) {
         taintedRefs.push({
           source_id: srcDoc.cosheaf_id,
@@ -347,14 +515,14 @@ export function workspaceValidation(
                    AND duplicate.target_id = xref_targets.target_id
                    AND duplicate.source_path = xref_targets.source_path
               )
-           UNION ALL
-           SELECT target_id AS id, source_path || ' (' || count || ' definitions)' AS path_note, count
-             FROM xref_target_duplicates
-            WHERE workspace_slug = ?
-         )
-        GROUP BY id
-       HAVING sum(count) > 1
-        ORDER BY id`,
+            UNION ALL
+            SELECT target_id AS id, source_path || ' (' || count || ' definitions)' AS path_note, count
+              FROM xref_target_duplicates
+             WHERE workspace_slug = ?
+          )
+         GROUP BY id
+        HAVING sum(count) > 1
+         ORDER BY id`,
     )
     .all(workspaceSlug, workspaceSlug) as WorkspaceValidation["duplicate_xrefs"];
 
