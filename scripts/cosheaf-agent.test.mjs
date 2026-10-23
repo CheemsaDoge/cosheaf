@@ -252,4 +252,120 @@ verify:
       }
     }
   });
+
+  it("resolves document-local crossrefs before workspace page IDs without false taint", () => {
+    const workDir = mkdtempSync(path.join(tmpdir(), "cosheaf-local-xref-"));
+    try {
+      writeFileSync(
+        path.join(workDir, "a.md"),
+        `---
+id: a
+status: proved
+---
+# Page A
+
+## Local B {#b}
+
+See [@b].
+`,
+        "utf8",
+      );
+      writeFileSync(
+        path.join(workDir, "b.md"),
+        `---
+id: b
+status: draft
+---
+# Draft Page B
+`,
+        "utf8",
+      );
+
+      const result = verifyLocalWorkspace({ dir: workDir });
+      expect(result.ok).toBe(true);
+      expect(result.tainted_refs).toEqual([]);
+    } finally {
+      try {
+        rmSync(workDir, { recursive: true, force: true });
+      } catch (_err) {
+        // cleanup ignore
+      }
+    }
+  });
+
+  it("supports symbol-only Lean verify specifications", () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), "cosheaf-lean-sym-"));
+    const binDir = path.join(tmpDir, "bin");
+    const workDir = path.join(tmpDir, "work");
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(workDir, { recursive: true });
+
+    const leanScript = path.join(binDir, "lean");
+    writeFileSync(
+      leanScript,
+      `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  exit 0
+fi
+target="$1"
+if [ -f "$target" ] && grep -Fq '#check Nat.add' "$target"; then
+  printf 'Nat.add : Nat -> Nat -> Nat\\n'
+  exit 0
+else
+  exit 1
+fi
+`,
+      "utf8",
+    );
+    chmodSync(leanScript, 0o755);
+
+    writeFileSync(
+      path.join(workDir, "lean-sym.md"),
+      `---
+id: lean-sym
+status: proved
+verify:
+  - kind: lean
+    symbol: Nat.add
+---
+# Lean Symbol Test
+`,
+      "utf8",
+    );
+
+    const oldPath = process.env.PATH;
+    try {
+      process.env.PATH = `${binDir}:${oldPath}`;
+      const result = verifyLocalWorkspace({ dir: workDir });
+      expect(result.ok).toBe(true);
+      expect(result.verification_results).toHaveLength(1);
+      expect(result.verification_results[0].status).toBe("pass");
+    } finally {
+      process.env.PATH = oldPath;
+      try {
+        rmSync(tmpDir, { recursive: true, force: true });
+      } catch (_err) {
+        // cleanup ignore
+      }
+    }
+  });
+
+  it("fails verification when --dir points to a file instead of a directory", () => {
+    const workDir = mkdtempSync(path.join(tmpdir(), "cosheaf-dir-file-"));
+    try {
+      const readmePath = path.join(workDir, "README.md");
+      writeFileSync(readmePath, "# Readme\n", "utf8");
+
+      const result = verifyLocalWorkspace({ dir: readmePath });
+      expect(result.ok).toBe(false);
+      expect(result.checked_files).toBe(0);
+      expect(result.verification_results[0].status).toBe("error");
+    } finally {
+      try {
+        rmSync(workDir, { recursive: true, force: true });
+      } catch (_err) {
+        // cleanup ignore
+      }
+    }
+  });
 });
