@@ -431,4 +431,50 @@ By [@cycle-a], B holds.
       }
     }
   });
+
+  it("skips .lake directory during workspace markdown scanning", () => {
+    const workDir = mkdtempSync(path.join(tmpdir(), "cosheaf-lake-skip-"));
+    try {
+      const lakePackageDir = path.join(workDir, ".lake", "packages", "dep");
+      mkdirSync(lakePackageDir, { recursive: true });
+
+      writeFileSync(
+        path.join(lakePackageDir, "README.md"),
+        `---
+id: dep-readme
+status: draft
+---
+# Dependency README
+
+By [@workspace-doc], cycle back.
+`,
+        "utf8",
+      );
+
+      writeFileSync(
+        path.join(workDir, "workspace-doc.md"),
+        `---
+id: workspace-doc
+status: proved
+---
+# Workspace Document
+
+See [Dependency README](.lake/packages/dep/README.md).
+`,
+        "utf8",
+      );
+
+      const result = verifyLocalWorkspace({ dir: workDir });
+      expect(result.checked_files).toBe(1);
+      expect(result.ok).toBe(true);
+      expect(result.cyclic_refs).toEqual([]);
+      expect(result.tainted_refs).toEqual([]);
+    } finally {
+      try {
+        rmSync(workDir, { recursive: true, force: true });
+      } catch (_err) {
+        // cleanup ignore
+      }
+    }
+  });
 });

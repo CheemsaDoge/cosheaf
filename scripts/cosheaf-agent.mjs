@@ -246,7 +246,7 @@ function printResult(result, json) {
   }
 }
 
-const SKIP_DIRS = new Set([".git", "node_modules", "dist", ".cosheaf"]);
+const SKIP_DIRS = new Set([".git", ".lake", "node_modules", "dist", ".cosheaf"]);
 
 function findMarkdownFiles(dir) {
   const mdFiles = [];
