@@ -31,15 +31,21 @@ export async function ensureWorkspaceStatusesBackfilled(
     .all(workspaceSlug) as Array<{ cosheaf_id: string; forgejo_id: string }>;
   if (missing.length === 0) return;
 
+  const checkStillNull = db.prepare(
+    "SELECT 1 FROM doc_map WHERE workspace_slug = ? AND cosheaf_id = ? AND forgejo_id = ? AND status IS NULL",
+  );
   const updateStmt = db.prepare(
-    "UPDATE doc_map SET status = ? WHERE workspace_slug = ? AND cosheaf_id = ?",
+    "UPDATE doc_map SET status = ? WHERE workspace_slug = ? AND cosheaf_id = ? AND forgejo_id = ? AND status IS NULL",
   );
   for (const row of missing) {
+    if (!checkStillNull.get(workspaceSlug, row.cosheaf_id, row.forgejo_id)) {
+      continue;
+    }
     try {
       const raw = await backend.getRawFile(owner, repo, "main", row.forgejo_id);
       const { frontmatter } = parseFrontmatterYaml(raw);
       const status = normalizeTheoremStatus(frontmatter.status);
-      updateStmt.run(status, workspaceSlug, row.cosheaf_id);
+      updateStmt.run(status, workspaceSlug, row.cosheaf_id, row.forgejo_id);
     } catch (_err) {
       // Keep null if raw file cannot be read right now
     }
