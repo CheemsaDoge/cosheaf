@@ -43,6 +43,203 @@ function resolveSafePath(workspaceRoot: string, targetPath?: string): string | n
   return resolved;
 }
 
+const LEAN_PRELUDE_NAMESPACES = new Set([
+  "Nat",
+  "Int",
+  "Bool",
+  "List",
+  "String",
+  "Char",
+  "Array",
+  "Option",
+  "Prod",
+  "Sum",
+  "Subtype",
+  "Sigma",
+  "Fin",
+  "BitVec",
+  "UInt8",
+  "UInt16",
+  "UInt32",
+  "UInt64",
+  "USize",
+  "Float",
+  "IO",
+  "Task",
+  "Except",
+  "EStateM",
+  "StateT",
+  "ReaderT",
+  "Id",
+  "Classical",
+  "Function",
+  "Decidable",
+  "Eq",
+  "Iff",
+  "And",
+  "Or",
+  "Not",
+  "Exists",
+  "True",
+  "False",
+  "Empty",
+  "Unit",
+  "PUnit",
+  "ULift",
+  "PLift",
+  "Lean",
+  "Std",
+]);
+
+function scanLeanFiles(
+  dir: string,
+  baseDir: string,
+  result: Array<{ relPath: string; absPath: string }>,
+  maxDepth = 10,
+): void {
+  if (maxDepth <= 0) return;
+  const IGNORE_DIRS = new Set([
+    ".git",
+    ".lake",
+    "node_modules",
+    "dist",
+    ".cosheaf",
+  ]);
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (_err) {
+    return;
+  }
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      if (!IGNORE_DIRS.has(entry.name)) {
+        scanLeanFiles(
+          path.join(dir, entry.name),
+          baseDir,
+          result,
+          maxDepth - 1,
+        );
+      }
+    } else if (entry.isFile() && entry.name.endsWith(".lean")) {
+      const absPath = path.join(dir, entry.name);
+      const relPath = path.relative(baseDir, absPath);
+      result.push({ relPath, absPath });
+    }
+  }
+}
+
+export function resolveWorkspaceLeanModules(
+  workspaceRoot: string,
+  symbol: string,
+  explicitFile?: string,
+): { modules: string[]; files: string[] } {
+  const modulesSet = new Set<string>();
+  const filesSet = new Set<string>();
+
+  if (explicitFile) {
+    const explicitAbs = resolveSafePath(workspaceRoot, explicitFile);
+    if (explicitAbs && fs.existsSync(explicitAbs)) {
+      const rel = path
+        .relative(workspaceRoot, explicitAbs)
+        .replace(/\\/g, "/");
+      let modName = rel
+        .replace(/\.lean$/i, "")
+        .split("/")
+        .filter(Boolean)
+        .join(".");
+      if (rel.startsWith("src/")) {
+        const withoutSrc = rel
+          .slice(4)
+          .replace(/\.lean$/i, "")
+          .split("/")
+          .filter(Boolean)
+          .join(".");
+        if (symbol === withoutSrc || symbol.startsWith(`${withoutSrc}.`)) {
+          modName = withoutSrc;
+        }
+      }
+      if (modName) {
+        modulesSet.add(modName);
+      }
+      filesSet.add(explicitAbs);
+    }
+  }
+
+  const leanFiles: Array<{ relPath: string; absPath: string }> = [];
+  scanLeanFiles(workspaceRoot, workspaceRoot, leanFiles);
+
+  const shortName = symbol.split(".").pop() ?? symbol;
+  const escapedShortName = shortName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const declRegex = new RegExp(
+    `\\b(?:theorem|lemma|def|abbrev|inductive|structure|class|instance|axiom|opaque)\\s+${escapedShortName}(?:\\b|(?![\\w']))`,
+  );
+
+  for (const file of leanFiles) {
+    const normalizedRel = file.relPath.replace(/\\/g, "/");
+    let modName = normalizedRel
+      .replace(/\.lean$/i, "")
+      .split("/")
+      .filter(Boolean)
+      .join(".");
+    if (normalizedRel.startsWith("src/")) {
+      const withoutSrc = normalizedRel
+        .slice(4)
+        .replace(/\.lean$/i, "")
+        .split("/")
+        .filter(Boolean)
+        .join(".");
+      if (symbol === withoutSrc || symbol.startsWith(`${withoutSrc}.`)) {
+        modName = withoutSrc;
+      }
+    }
+
+    let matched = false;
+    if (symbol.includes(".")) {
+      if (symbol === modName || symbol.startsWith(`${modName}.`)) {
+        matched = true;
+      }
+    }
+
+    let content = "";
+    try {
+      content = fs.readFileSync(file.absPath, "utf8");
+    } catch (_err) {
+      content = "";
+    }
+
+    if (
+      !matched &&
+      (declRegex.test(content) || (symbol && content.includes(symbol)))
+    ) {
+      matched = true;
+    }
+
+    if (matched) {
+      if (modName) {
+        modulesSet.add(modName);
+      }
+      filesSet.add(file.absPath);
+    }
+  }
+
+  if (modulesSet.size === 0 && filesSet.size === 0 && symbol.includes(".")) {
+    const parts = symbol.split(".");
+    const rootNs = parts[0] ?? "";
+    if (rootNs && !LEAN_PRELUDE_NAMESPACES.has(rootNs)) {
+      const modPrefix = parts.slice(0, -1).join(".");
+      if (modPrefix) {
+        modulesSet.add(modPrefix);
+      }
+    }
+  }
+
+  return {
+    modules: Array.from(modulesSet),
+    files: Array.from(filesSet),
+  };
+}
+
 export function runVerifySpec(
   workspaceRoot: string,
   docPath: string,
@@ -376,6 +573,49 @@ export function runVerifySpec(
   }
 
   if (spec.kind === "lean") {
+    if (!spec.file && !spec.symbol) {
+      return {
+        docPath,
+        kind: "lean",
+        status: "error",
+        command: [],
+        exitCode: null,
+        durationMs: Date.now() - startTime,
+        message: "Missing file or symbol in lean verify spec",
+        alignment: "not_checked",
+      };
+    }
+
+    if (spec.symbol && !/^[A-Za-z_][\w.']*$/.test(spec.symbol.trim())) {
+      return {
+        docPath,
+        kind: "lean",
+        status: "error",
+        command: [],
+        exitCode: null,
+        durationMs: Date.now() - startTime,
+        message: `Invalid Lean symbol name: ${spec.symbol}`,
+        alignment: "not_checked",
+      };
+    }
+
+    let fileAbs: string | null = null;
+    if (spec.file) {
+      fileAbs = resolveSafePath(workspaceRoot, spec.file);
+      if (!fileAbs || !fs.existsSync(fileAbs)) {
+        return {
+          docPath,
+          kind: "lean",
+          status: "error",
+          command: [],
+          exitCode: null,
+          durationMs: Date.now() - startTime,
+          message: `Lean file not found or outside workspace: ${spec.file}`,
+          alignment: "not_checked",
+        };
+      }
+    }
+
     if (!hasBinary("lean")) {
       return {
         docPath,
@@ -389,27 +629,26 @@ export function runVerifySpec(
       };
     }
 
-    if (spec.file) {
-      const fileAbs = resolveSafePath(workspaceRoot, spec.file);
-      if (!fileAbs || !fs.existsSync(fileAbs)) {
-        return {
-          docPath,
-          kind: "lean",
-          status: "error",
-          command: [],
-          exitCode: null,
-          durationMs: Date.now() - startTime,
-          message: `Lean file not found or outside workspace: ${spec.file}`,
-          alignment: "not_checked",
-        };
-      }
+    const hasLake =
+      (fs.existsSync(path.join(workspaceRoot, "lakefile.lean")) ||
+        fs.existsSync(path.join(workspaceRoot, "lakefile.toml"))) &&
+      hasBinary("lake");
 
-      const command = ["lean", fileAbs];
-      const res = spawnSync("lean", [fileAbs], {
-        cwd: workspaceRoot,
-        encoding: "utf8",
-        timeout,
-      });
+    if (fileAbs && !spec.symbol) {
+      const command = hasLake
+        ? ["lake", "env", "lean", fileAbs]
+        : ["lean", fileAbs];
+      const res = hasLake
+        ? spawnSync("lake", ["env", "lean", fileAbs], {
+            cwd: workspaceRoot,
+            encoding: "utf8",
+            timeout,
+          })
+        : spawnSync("lean", [fileAbs], {
+            cwd: workspaceRoot,
+            encoding: "utf8",
+            timeout,
+          });
 
       if (res.error) {
         return {
@@ -434,23 +673,73 @@ export function runVerifySpec(
         durationMs: Date.now() - startTime,
         message: pass
           ? (res.stdout?.trim() || "Lean verification passed")
-          : (res.stderr?.trim() || res.stdout?.trim() || `Lean exited with code ${res.status}`),
+          : (res.stderr?.trim() ||
+            res.stdout?.trim() ||
+            `Lean exited with code ${res.status}`),
         alignment: "not_checked",
       };
     }
 
     if (spec.symbol) {
+      const symbol = spec.symbol.trim();
       let tmpDir: string | null = null;
       try {
         tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "lean-verify-"));
+        const { modules, files } = resolveWorkspaceLeanModules(
+          workspaceRoot,
+          symbol,
+          spec.file,
+        );
+        const importLines = modules.map((m) => `import ${m}`).join("\n");
         const probeFile = path.join(tmpDir, "Probe.lean");
-        fs.writeFileSync(probeFile, `#check ${spec.symbol}\n`, "utf8");
-        const command = ["lean", probeFile];
-        const res = spawnSync("lean", [probeFile], {
-          cwd: workspaceRoot,
-          encoding: "utf8",
-          timeout,
-        });
+        const probeContent = importLines
+          ? `${importLines}\n\n#check ${symbol}\n`
+          : `#check ${symbol}\n`;
+        fs.writeFileSync(probeFile, probeContent, "utf8");
+
+        const env = { ...process.env, LEAN_SRC_PATH: workspaceRoot };
+        let command = hasLake
+          ? ["lake", "env", "lean", probeFile]
+          : ["lean", probeFile];
+        let res = hasLake
+          ? spawnSync("lake", ["env", "lean", probeFile], {
+              cwd: workspaceRoot,
+              env,
+              encoding: "utf8",
+              timeout,
+            })
+          : spawnSync("lean", [probeFile], {
+              cwd: workspaceRoot,
+              env,
+              encoding: "utf8",
+              timeout,
+            });
+
+        if (res.status !== 0 && files.length > 0) {
+          const inlineSources: string[] = [];
+          for (const f of files) {
+            try {
+              inlineSources.push(fs.readFileSync(f, "utf8"));
+            } catch (_err) {
+              // ignore read failure
+            }
+          }
+          if (inlineSources.length > 0) {
+            const inlineFile = path.join(tmpDir, "ProbeInline.lean");
+            fs.writeFileSync(
+              inlineFile,
+              `${inlineSources.join("\n\n")}\n\n#check ${symbol}\n`,
+              "utf8",
+            );
+            command = ["lean", inlineFile];
+            res = spawnSync("lean", [inlineFile], {
+              cwd: workspaceRoot,
+              env,
+              encoding: "utf8",
+              timeout,
+            });
+          }
+        }
 
         if (res.error) {
           return {
@@ -490,17 +779,6 @@ export function runVerifySpec(
         }
       }
     }
-
-    return {
-      docPath,
-      kind: "lean",
-      status: "error",
-      command: [],
-      exitCode: null,
-      durationMs: Date.now() - startTime,
-      message: "Neither file nor symbol specified in lean verify spec",
-      alignment: "not_checked",
-    };
   }
 
   return {
