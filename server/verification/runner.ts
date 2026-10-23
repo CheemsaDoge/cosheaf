@@ -179,12 +179,33 @@ export function runVerifySpec(
       };
     }
 
-    const output = `${res.stdout ?? ""}\n${res.stderr ?? ""}`;
+    const lines = (res.stdout ?? "").split(/\r?\n/).map((line) => line.trim());
+    let parsedLine: "sat" | "unsat" | null = null;
+    for (const line of lines) {
+      if (/^s\s+SATISFIABLE$/i.test(line)) {
+        parsedLine = "sat";
+        break;
+      }
+      if (/^s\s+UNSATISFIABLE$/i.test(line)) {
+        parsedLine = "unsat";
+        break;
+      }
+    }
+
     let actual: "sat" | "unsat" | null = null;
-    if (output.includes("s SATISFIABLE") || res.status === 10) {
+    if (res.status !== 0 && res.status !== 10 && res.status !== 20) {
+      actual = null;
+    } else if (res.status === 10 && parsedLine !== "unsat") {
       actual = "sat";
-    } else if (output.includes("s UNSATISFIABLE") || res.status === 20) {
+    } else if (res.status === 20 && parsedLine !== "sat") {
       actual = "unsat";
+    } else if (
+      res.status === 0 &&
+      (parsedLine === "sat" || parsedLine === "unsat")
+    ) {
+      actual = parsedLine;
+    } else {
+      actual = null;
     }
 
     if (!actual) {
@@ -284,15 +305,33 @@ export function runVerifySpec(
       };
     }
 
+    if (res.status !== 0) {
+      return {
+        docPath,
+        kind: "smt",
+        status: "fail",
+        command,
+        exitCode: res.status,
+        durationMs: Date.now() - startTime,
+        message:
+          res.stderr?.trim() ||
+          res.stdout?.trim() ||
+          `SMT solver exited with code ${res.status}`,
+      };
+    }
+
     const stdoutLines = (res.stdout ?? "")
       .split(/\r?\n/)
       .map((line) => line.trim())
       .filter((line) => line.length > 0);
-    const firstLine = stdoutLines[0]?.toLowerCase() ?? "";
 
     let actual: "sat" | "unsat" | null = null;
-    if (firstLine === "sat" || firstLine === "unsat") {
-      actual = firstLine;
+    for (const line of stdoutLines) {
+      const lower = line.toLowerCase();
+      if (lower === "sat" || lower === "unsat") {
+        actual = lower;
+        break;
+      }
     }
 
     if (!actual) {
@@ -306,7 +345,7 @@ export function runVerifySpec(
         message:
           res.stderr?.trim() ||
           res.stdout?.trim() ||
-          `Unexpected z3 output: ${firstLine || "(empty)"}`,
+          `Unexpected z3 output: ${stdoutLines[0] || "(empty)"}`,
       };
     }
 
@@ -325,17 +364,14 @@ export function runVerifySpec(
       };
     }
 
-    const pass = res.status === 0;
     return {
       docPath,
       kind: "smt",
-      status: pass ? "pass" : "fail",
+      status: "pass",
       command,
       exitCode: res.status,
       durationMs: Date.now() - startTime,
-      message: pass
-        ? `SMT check passed (actual: ${actual})`
-        : (res.stderr?.trim() || `SMT check failed with exit code ${res.status}`),
+      message: `SMT check passed (actual: ${actual})`,
     };
   }
 
