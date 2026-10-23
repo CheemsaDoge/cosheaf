@@ -4,6 +4,7 @@
 
 import { resolveMarkdownReferencePathFromDocument } from "@chaoxu/coflat/parse";
 import type Database from "better-sqlite3";
+import { normalizeTheoremStatus } from "../shared/theorem-status.js";
 import { extractBibTeXCitationKeys } from "./citations.js";
 import { coflatMarkdownFormat } from "./document-format/coflat.js";
 import type { DocumentLink, ParsedDocument } from "./document-format/types.js";
@@ -124,6 +125,7 @@ export function planIndexPage(db: Database.Database, p: PageIngest): IngestPlan 
       : null;
   const title = explicitTitle ?? format.extractTitle(parsed.body);
   const excerpt = pageExcerpt(parsed.body);
+  const status = normalizeTheoremStatus(parsed.frontmatter.status);
 
   const commitBacklinksOnly = db.transaction(() => {
     replaceBacklinks(db, p.workspaceSlug, cosheafId, p.filePath, p.bodyText, links);
@@ -144,13 +146,13 @@ export function planIndexPage(db: Database.Database, p: PageIngest): IngestPlan 
       .get(p.workspaceSlug, cosheafId) as { fts_rowid: number | null } | undefined;
     deleteFtsRow(db, p.workspaceSlug, cosheafId, existingDoc?.fts_rowid ?? null);
     if (exists) {
-      prep(db, "UPDATE doc_map SET forgejo_id = ?, title = ?, excerpt = ? WHERE workspace_slug = ? AND cosheaf_id = ?")
-        .run(p.filePath, title, excerpt, p.workspaceSlug, cosheafId);
+      prep(db, "UPDATE doc_map SET forgejo_id = ?, title = ?, excerpt = ?, status = ? WHERE workspace_slug = ? AND cosheaf_id = ?")
+        .run(p.filePath, title, excerpt, status, p.workspaceSlug, cosheafId);
     } else {
       prep(
         db,
-        "INSERT INTO doc_map (cosheaf_id, workspace_slug, forgejo_id, title, excerpt, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-      ).run(cosheafId, p.workspaceSlug, p.filePath, title, excerpt, Date.now());
+        "INSERT INTO doc_map (cosheaf_id, workspace_slug, forgejo_id, title, excerpt, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ).run(cosheafId, p.workspaceSlug, p.filePath, title, excerpt, status, Date.now());
     }
     const ftsInsert = prep(
       db,

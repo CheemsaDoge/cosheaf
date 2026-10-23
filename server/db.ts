@@ -398,6 +398,14 @@ function migrateAddLoginTokenScopes(db: Database.Database): void {
   if (!hasScopes) db.exec("ALTER TABLE login_tokens ADD COLUMN scopes TEXT");
 }
 
+function migrateAddDocMapStatus(db: Database.Database): void {
+  const hasStatus = (db.prepare("PRAGMA table_info(doc_map)").all() as Array<{ name: string }>)
+    .some((col) => col.name === "status");
+  if (!hasStatus) {
+    db.exec("ALTER TABLE doc_map ADD COLUMN status TEXT NOT NULL DEFAULT 'proved'");
+  }
+}
+
 function collapseExcerpt(body: string | null, maxLength = 220): string | null {
   const text = (body ?? "").replace(/\s+/g, " ").trim();
   if (!text) return null;
@@ -442,6 +450,7 @@ export function getDb(config: Config): Database.Database {
   bootstrapSiteAdmins(db);
   migrateAddDocMapExcerptAndFtsRowid(db);
   migrateAddLoginTokenScopes(db);
+  migrateAddDocMapStatus(db);
   dbInstance = db;
   return db;
 }

@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS doc_map (
   title TEXT,
   excerpt TEXT,
   fts_rowid INTEGER,
+  status TEXT NOT NULL DEFAULT 'proved' CHECK (status IN ('draft', 'proved', 'refuted')),
   created_at INTEGER NOT NULL,
   PRIMARY KEY (workspace_slug, cosheaf_id),
   UNIQUE (workspace_slug, forgejo_id)
