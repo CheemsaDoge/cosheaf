@@ -308,9 +308,19 @@ if [ "$1" = "--version" ]; then
   exit 0
 fi
 target="$1"
-if [ -f "$target" ] && grep -Fq '#check Nat.add' "$target"; then
+if [ ! -f "$target" ]; then
+  exit 1
+fi
+if grep -Fq '#check Nat.add' "$target"; then
   printf 'Nat.add : Nat -> Nat -> Nat\\n'
   exit 0
+elif grep -Fq '#check MyProject.main' "$target"; then
+  if grep -Fq 'import MyProject' "$target" || grep -Fq 'def main' "$target"; then
+    printf 'MyProject.main : Nat\\n'
+    exit 0
+  else
+    exit 1
+  fi
 else
   exit 1
 fi
@@ -320,6 +330,15 @@ fi
     chmodSync(leanScript, 0o755);
 
     writeFileSync(
+      path.join(workDir, "MyProject.lean"),
+      `namespace MyProject
+def main : Nat := 42
+end MyProject
+`,
+      "utf8",
+    );
+
+    writeFileSync(
       path.join(workDir, "lean-sym.md"),
       `---
 id: lean-sym
@@ -327,6 +346,8 @@ status: proved
 verify:
   - kind: lean
     symbol: Nat.add
+  - kind: lean
+    symbol: MyProject.main
 ---
 # Lean Symbol Test
 `,
@@ -338,12 +359,54 @@ verify:
       process.env.PATH = `${binDir}:${oldPath}`;
       const result = verifyLocalWorkspace({ dir: workDir });
       expect(result.ok).toBe(true);
-      expect(result.verification_results).toHaveLength(1);
+      expect(result.verification_results).toHaveLength(2);
       expect(result.verification_results[0].status).toBe("pass");
+      expect(result.verification_results[1].status).toBe("pass");
     } finally {
       process.env.PATH = oldPath;
       try {
         rmSync(tmpDir, { recursive: true, force: true });
+      } catch (_err) {
+        // cleanup ignore
+      }
+    }
+  });
+
+  it("fails verification and reports cyclic_refs when proved documents form a dependency cycle", () => {
+    const workDir = mkdtempSync(path.join(tmpdir(), "cosheaf-cycle-"));
+    try {
+      writeFileSync(
+        path.join(workDir, "cycle-a.md"),
+        `---
+id: cycle-a
+status: proved
+---
+# Cycle A
+
+By [@cycle-b], A holds.
+`,
+        "utf8",
+      );
+      writeFileSync(
+        path.join(workDir, "cycle-b.md"),
+        `---
+id: cycle-b
+status: proved
+---
+# Cycle B
+
+By [@cycle-a], B holds.
+`,
+        "utf8",
+      );
+
+      const result = verifyLocalWorkspace({ dir: workDir });
+      expect(result.ok).toBe(false);
+      expect(result.cyclic_refs).toHaveLength(1);
+      expect(result.cyclic_refs[0].cycle_paths).toEqual(["cycle-a.md", "cycle-b.md"]);
+    } finally {
+      try {
+        rmSync(workDir, { recursive: true, force: true });
       } catch (_err) {
         // cleanup ignore
       }

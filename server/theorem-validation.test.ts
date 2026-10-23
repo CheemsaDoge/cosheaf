@@ -209,6 +209,56 @@ describe("direct and transitive dependency taint detection (tainted_refs)", () =
     expect(res.tainted_refs?.[0]?.target_path).toBe("b.md");
   });
 
+  it("does not overwrite freshly indexed status if concurrent reindex completes during backfill", async () => {
+    const db = freshDb();
+
+    indexPageBatch(db, "owner/w", [
+      {
+        path: "a.md",
+        body: "---\nid: a\nstatus: proved\n---\n# A\n\nSee [@b].\n",
+      },
+      {
+        path: "b.md",
+        body: "---\nid: b\nstatus: proved\n---\n# B\n",
+      },
+    ]);
+
+    db.prepare(
+      "UPDATE doc_map SET status = NULL WHERE workspace_slug = 'owner/w' AND cosheaf_id = 'b'",
+    ).run();
+
+    const backend = {
+      getRawFile: async (_o: string, _r: string, _ref: string, p: string) => {
+        if (p === "b.md") {
+          db.prepare(
+            "UPDATE doc_map SET status = 'draft' WHERE workspace_slug = 'owner/w' AND cosheaf_id = 'b'",
+          ).run();
+          return "---\nid: b\nstatus: proved\n---\n# Old B\n";
+        }
+        return "---\nid: a\nstatus: proved\n---\n# A\n\nSee [@b].\n";
+      },
+    };
+
+    await ensureWorkspaceStatusesBackfilled(
+      db,
+      backend,
+      "owner",
+      "w",
+      "owner/w",
+    );
+
+    const res = workspaceValidation(db, "owner/w");
+    expect(res.tainted_refs).toHaveLength(1);
+    expect(res.tainted_refs?.[0]?.target_path).toBe("b.md");
+
+    const rowB = db
+      .prepare(
+        "SELECT status FROM doc_map WHERE workspace_slug = 'owner/w' AND cosheaf_id = 'b'",
+      )
+      .get() as { status: string | null } | undefined;
+    expect(rowB?.status).toBe("draft");
+  });
+
   it("resolves document-local crossrefs before workspace page IDs without false taint", () => {
     const db = freshDb();
 
@@ -499,6 +549,58 @@ describe("executable verifiers (runVerifySpec & verifyDocumentContent)", () => {
       process.env.PATH = originalPath;
       try {
         rmSync(tmpDir, { recursive: true, force: true });
+      } catch (_err) {
+        // cleanup ignore
+      }
+    }
+  });
+
+  it("loads defining workspace module before checking Lean symbol in runVerifySpec", () => {
+    const tmpDir = mkdtempSync(
+      path.join(tmpdir(), "cosheaf-lean-symbol-test-"),
+    );
+    const binDir = mkdtempSync(path.join(tmpdir(), "cosheaf-lean-bin-"));
+    const originalPath = process.env.PATH;
+
+    try {
+      const myProjectLean = path.join(tmpDir, "MyProject.lean");
+      writeFileSync(
+        myProjectLean,
+        "namespace MyProject\ndef main : Nat := 42\nend MyProject\n",
+        "utf8",
+      );
+
+      const leanBin = path.join(binDir, "lean");
+      const leanScript = [
+        "#!/bin/sh",
+        'file="$1"',
+        'if [ -f "$file" ] && grep -q "#check MyProject.main" "$file" && (grep -q "import MyProject" "$file" || grep -q "def main" "$file"); then',
+        '  printf "MyProject.main : Nat\\n"',
+        "  exit 0",
+        "else",
+        '  printf "unknown identifier \'MyProject.main\'\\n" >&2',
+        "  exit 1",
+        "fi",
+        "",
+      ].join("\n");
+      writeFileSync(leanBin, leanScript, { mode: 0o755 });
+
+      process.env.PATH = `${binDir}:${originalPath ?? ""}`;
+
+      const res = runVerifySpec(tmpDir, "doc.md", {
+        kind: "lean",
+        symbol: "MyProject.main",
+      });
+      expect(res.status).toBe("pass");
+    } finally {
+      process.env.PATH = originalPath;
+      try {
+        rmSync(tmpDir, { recursive: true, force: true });
+      } catch (_err) {
+        // cleanup ignore
+      }
+      try {
+        rmSync(binDir, { recursive: true, force: true });
       } catch (_err) {
         // cleanup ignore
       }
