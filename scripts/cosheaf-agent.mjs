@@ -1267,6 +1267,45 @@ export function verifyLocalWorkspace(options = {}) {
                 existsSync(path.join(rootDir, "lakefile.toml"))) &&
               isBinaryAvailable("lake");
 
+            if (hasLake && modules.length > 0) {
+              const buildRes = spawnSync("lake", ["build", ...modules], {
+                cwd: rootDir,
+                env: { ...process.env, LEAN_SRC_PATH: rootDir },
+                encoding: "utf8",
+                timeout: timeoutMs,
+              });
+              if (buildRes.error) {
+                if (buildRes.error.code === "ENOENT") {
+                  verification_results.push({
+                    docPath: doc.relPath,
+                    kind: "lean",
+                    status: "skipped",
+                    message: "lake is not installed",
+                    alignment: "not_checked",
+                  });
+                } else {
+                  verification_results.push({
+                    docPath: doc.relPath,
+                    kind: "lean",
+                    status: "fail",
+                    message: buildRes.error.message,
+                    alignment: "not_checked",
+                  });
+                }
+                continue;
+              } else if (buildRes.status !== 0) {
+                const errMsg = (buildRes.stderr || buildRes.stdout || `Lake build failed with code ${buildRes.status}`).trim().split("\n")[0];
+                verification_results.push({
+                  docPath: doc.relPath,
+                  kind: "lean",
+                  status: "fail",
+                  message: errMsg || `Lake build failed with code ${buildRes.status}`,
+                  alignment: "not_checked",
+                });
+                continue;
+              }
+            }
+
             let res = hasLake
               ? spawnSync("lake", ["env", "lean", probeFile], {
                   cwd: rootDir,

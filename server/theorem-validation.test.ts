@@ -402,7 +402,7 @@ describe("cyclic reference detection (cyclic_refs)", () => {
     expect(fullValidation.cyclic_refs).toEqual(theoremValidation.cyclic_refs);
   });
 
-  it("handles a 4000-page acyclic reference chain without call stack overflow", () => {
+  it("handles a 4000-page acyclic reference chain without call stack overflow", { timeout: 15000 }, () => {
     const db = freshDb();
     const count = 4000;
 
@@ -453,7 +453,7 @@ describe("cyclic reference detection (cyclic_refs)", () => {
 
     expect(fullValidation?.cyclic_refs ?? []).toEqual([]);
     expect(fullValidation?.tainted_refs).toHaveLength(3999);
-  }, 15000);
+  });
 
   it("validates an 8000-page all-proved reference chain in linear time without quadratic slowdown", () => {
     const db = freshDb();
@@ -579,6 +579,76 @@ describe("executable verifiers (runVerifySpec & verifyDocumentContent)", () => {
     } finally {
       try {
         rmSync(tmpDir, { recursive: true, force: true });
+      } catch (_err) {
+        // cleanup ignore
+      }
+    }
+  });
+
+  it("rebuilds Lake module before probing Lean symbol to prevent stale .olean false passes", () => {
+    const tmpDir = mkdtempSync(
+      path.join(tmpdir(), "cosheaf-lake-rebuild-test-"),
+    );
+    const binDir = mkdtempSync(path.join(tmpdir(), "cosheaf-lake-bin-"));
+    const originalPath = process.env.PATH;
+
+    try {
+      writeFileSync(path.join(tmpDir, "lakefile.toml"), 'name = "test"\n', "utf8");
+      const myModLean = path.join(tmpDir, "MyMod.lean");
+      // Source file where the symbol was deleted/broken
+      writeFileSync(myModLean, "-- MyMod without the symbol\n", "utf8");
+
+      const whichBin = path.join(binDir, "which");
+      writeFileSync(whichBin, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+
+      const leanBin = path.join(binDir, "lean");
+      // Mock lean that would pass if checked against stale compiled artifact without rebuild
+      writeFileSync(
+        leanBin,
+        '#!/bin/sh\nprintf "stale pass\\n"\nexit 0\n',
+        { mode: 0o755 },
+      );
+
+      const lakeBin = path.join(binDir, "lake");
+      // Mock lake that fails on build when source file is broken/missing symbol
+      const lakeScript = [
+        "#!/bin/sh",
+        'if [ "$1" = "build" ]; then',
+        '  if grep -q "deleted_symbol" MyMod.lean; then',
+        '    exit 0',
+        '  else',
+        '    printf "error: unknown identifier \'deleted_symbol\'\\n" >&2',
+        '    exit 1',
+        '  fi',
+        'fi',
+        'if [ "$1" = "env" ]; then',
+        '  shift',
+        '  exec "$@"',
+        'fi',
+        'exit 0',
+        "",
+      ].join("\n");
+      writeFileSync(lakeBin, lakeScript, { mode: 0o755 });
+
+      process.env.PATH = `${binDir}:${originalPath ?? ""}`;
+
+      const res = runVerifySpec(tmpDir, "doc.md", {
+        kind: "lean",
+        symbol: "MyMod.deleted_symbol",
+      });
+
+      expect(res.status).toBe("fail");
+      expect(res.command).toEqual(["lake", "build", "MyMod"]);
+      expect(res.message).toContain("unknown identifier 'deleted_symbol'");
+    } finally {
+      process.env.PATH = originalPath;
+      try {
+        rmSync(tmpDir, { recursive: true, force: true });
+      } catch (_err) {
+        // cleanup ignore
+      }
+      try {
+        rmSync(binDir, { recursive: true, force: true });
       } catch (_err) {
         // cleanup ignore
       }

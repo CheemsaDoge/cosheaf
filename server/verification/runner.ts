@@ -698,6 +698,43 @@ export function runVerifySpec(
         fs.writeFileSync(probeFile, probeContent, "utf8");
 
         const env = { ...process.env, LEAN_SRC_PATH: workspaceRoot };
+
+        if (hasLake && modules.length > 0) {
+          const buildRes = spawnSync("lake", ["build", ...modules], {
+            cwd: workspaceRoot,
+            env,
+            encoding: "utf8",
+            timeout,
+          });
+          if (buildRes.error) {
+            return {
+              docPath,
+              kind: "lean",
+              status: "error",
+              command: ["lake", "build", ...modules],
+              exitCode: buildRes.status,
+              durationMs: Date.now() - startTime,
+              message: buildRes.error.message,
+              alignment: "not_checked",
+            };
+          }
+          if (buildRes.status !== 0) {
+            return {
+              docPath,
+              kind: "lean",
+              status: "fail",
+              command: ["lake", "build", ...modules],
+              exitCode: buildRes.status,
+              durationMs: Date.now() - startTime,
+              message:
+                buildRes.stderr?.trim() ||
+                buildRes.stdout?.trim() ||
+                `Lake build failed with code ${buildRes.status}`,
+              alignment: "not_checked",
+            };
+          }
+        }
+
         let command = hasLake
           ? ["lake", "env", "lean", probeFile]
           : ["lean", probeFile];
