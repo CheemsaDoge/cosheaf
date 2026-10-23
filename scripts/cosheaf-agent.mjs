@@ -1,7 +1,16 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
 import {
@@ -241,11 +250,19 @@ const SKIP_DIRS = new Set([".git", "node_modules", "dist", ".cosheaf"]);
 
 function findMarkdownFiles(dir) {
   const mdFiles = [];
+  const scanErrors = [];
   function walk(currentDir) {
     let entries;
     try {
       entries = readdirSync(currentDir, { withFileTypes: true });
-    } catch (_error) {
+    } catch (scanError) {
+      const relDir = path.relative(dir, currentDir).split(path.sep).join("/") || ".";
+      scanErrors.push({
+        docPath: relDir,
+        kind: "workspace",
+        status: "error",
+        message: `Failed to scan directory '${relDir}': ${scanError instanceof Error ? scanError.message : String(scanError)}`,
+      });
       return;
     }
     for (const entry of entries) {
@@ -260,7 +277,7 @@ function findMarkdownFiles(dir) {
   }
   walk(dir);
   mdFiles.sort();
-  return mdFiles;
+  return { mdFiles, scanErrors };
 }
 
 function extractFrontmatterAndBody(content) {
@@ -304,16 +321,17 @@ function normalizeTheoremStatus(raw) {
 
 const binaryAvailabilityCache = new Map();
 function isBinaryAvailable(cmd) {
-  if (binaryAvailabilityCache.has(cmd)) {
-    return binaryAvailabilityCache.get(cmd);
+  const cacheKey = `${cmd}:${process.env.PATH ?? ""}`;
+  if (binaryAvailabilityCache.has(cacheKey)) {
+    return binaryAvailabilityCache.get(cacheKey);
   }
   try {
     const res = spawnSync(cmd, ["--version"], { stdio: "ignore" });
     const available = !(res.error && res.error.code === "ENOENT");
-    binaryAvailabilityCache.set(cmd, available);
+    binaryAvailabilityCache.set(cacheKey, available);
     return available;
   } catch (_error) {
-    binaryAvailabilityCache.set(cmd, false);
+    binaryAvailabilityCache.set(cacheKey, false);
     return false;
   }
 }
@@ -337,15 +355,58 @@ export function verifyLocalWorkspace(options = {}) {
     };
   }
 
-  const mdFilePaths = findMarkdownFiles(rootDir);
+  let rootStat = null;
+  try {
+    rootStat = statSync(rootDir);
+  } catch (statError) {
+    return {
+      ok: false,
+      dir: rootDir,
+      checked_files: 0,
+      verification_results: [
+        {
+          docPath: rootDir,
+          kind: "workspace",
+          status: "error",
+          message: statError instanceof Error ? statError.message : String(statError),
+        },
+      ],
+      tainted_refs: [],
+    };
+  }
+  if (!rootStat.isDirectory()) {
+    return {
+      ok: false,
+      dir: rootDir,
+      checked_files: 0,
+      verification_results: [
+        {
+          docPath: rootDir,
+          kind: "workspace",
+          status: "error",
+          message: `Not a directory: ${rootDir}`,
+        },
+      ],
+      tainted_refs: [],
+    };
+  }
+
+  const { mdFiles: mdFilePaths, scanErrors } = findMarkdownFiles(rootDir);
   const docs = [];
+  const verification_results = [...scanErrors];
 
   for (const fullPath of mdFilePaths) {
     const relPath = path.relative(rootDir, fullPath).split(path.sep).join("/");
     let content = "";
     try {
       content = readFileSync(fullPath, "utf8");
-    } catch (_readError) {
+    } catch (readError) {
+      verification_results.push({
+        docPath: relPath,
+        kind: "workspace",
+        status: "error",
+        message: `Failed to read file '${relPath}': ${readError instanceof Error ? readError.message : String(readError)}`,
+      });
       continue;
     }
     let frontmatter = {};
@@ -366,6 +427,7 @@ export function verifyLocalWorkspace(options = {}) {
     const targets = (catalog.targets || []).filter(
       (t) => typeof t.id === "string" && t.id.trim().length > 0,
     );
+    const localXrefIds = new Set(targets.map((t) => t.id.trim()));
     const links = extractDocumentReferences(content);
     const baseName = path.basename(relPath);
     const stem = path.basename(relPath, ".md");
@@ -383,6 +445,7 @@ export function verifyLocalWorkspace(options = {}) {
       frontmatter,
       body,
       targets,
+      localXrefIds,
       links,
     });
   }
@@ -416,6 +479,9 @@ export function verifyLocalWorkspace(options = {}) {
   function resolveLinkTargetDoc(srcDoc, link) {
     if (!link || typeof link !== "object") return null;
     if (link.kind === "id") {
+      if (srcDoc.localXrefIds && srcDoc.localXrefIds.has(link.ref)) {
+        return srcDoc;
+      }
       const byId = docById.get(link.ref);
       if (byId) return byId;
       if (xrefCounts.get(link.ref) === 1) {
@@ -432,50 +498,73 @@ export function verifyLocalWorkspace(options = {}) {
     return null;
   }
 
-  const adj = new Map();
+  const sortedAdj = new Map();
+  const revAdj = new Map();
   for (const doc of docs) {
-    adj.set(doc.relPath, new Set());
+    sortedAdj.set(doc.relPath, []);
+    revAdj.set(doc.relPath, []);
   }
 
   for (const doc of docs) {
-    const neighbors = adj.get(doc.relPath);
+    const targets = new Set();
     for (const link of doc.links) {
       const targetDoc = resolveLinkTargetDoc(doc, link);
       if (targetDoc && targetDoc !== doc) {
-        neighbors.add(targetDoc.relPath);
+        targets.add(targetDoc.relPath);
       }
+    }
+    const sortedTargets = Array.from(targets).sort((a, b) => a.localeCompare(b));
+    sortedAdj.set(doc.relPath, sortedTargets);
+    for (const tPath of sortedTargets) {
+      revAdj.get(tPath).push(doc.relPath);
     }
   }
 
-  function findNearestTainted(startDoc, originDoc) {
-    const queue = [{ relPath: startDoc.relPath, path: [startDoc.relPath] }];
-    const visited = new Set([startDoc.relPath, originDoc.relPath]);
+  for (const doc of docs) {
+    revAdj.get(doc.relPath).sort((a, b) => a.localeCompare(b));
+  }
 
-    while (queue.length > 0) {
-      const current = queue.shift();
-      if (!current) break;
+  const unprovedDocs = docs
+    .filter((d) => d.status !== "proved")
+    .sort((a, b) => a.relPath.localeCompare(b.relPath));
 
-      const neighbors = Array.from(adj.get(current.relPath) ?? []).sort((a, b) =>
-        a.localeCompare(b),
-      );
+  const distToTaint = new Map();
+  const nextHopToTaint = new Map();
+  const nearestTaintDoc = new Map();
 
-      for (const nextRelPath of neighbors) {
-        if (visited.has(nextRelPath)) continue;
-        visited.add(nextRelPath);
+  const queue = [];
+  for (const doc of unprovedDocs) {
+    distToTaint.set(doc.relPath, 0);
+    nextHopToTaint.set(doc.relPath, null);
+    nearestTaintDoc.set(doc.relPath, doc);
+    queue.push(doc.relPath);
+  }
 
-        const nextDoc = docByPath.get(nextRelPath);
-        if (!nextDoc) continue;
+  let queueHead = 0;
+  while (queueHead < queue.length) {
+    const currRelPath = queue[queueHead++];
+    const currDist = distToTaint.get(currRelPath);
+    const currTaintDoc = nearestTaintDoc.get(currRelPath);
 
-        const nextPath = [...current.path, nextDoc.relPath];
-        if (nextDoc.status !== "proved") {
-          return { targetDoc: nextDoc, viaPath: nextPath };
+    const predecessors = revAdj.get(currRelPath) ?? [];
+    for (const predRelPath of predecessors) {
+      const predDoc = docByPath.get(predRelPath);
+      if (!predDoc || predDoc.status !== "proved") {
+        continue;
+      }
+      if (!distToTaint.has(predRelPath)) {
+        distToTaint.set(predRelPath, currDist + 1);
+        nextHopToTaint.set(predRelPath, currRelPath);
+        nearestTaintDoc.set(predRelPath, currTaintDoc);
+        queue.push(predRelPath);
+      } else if (distToTaint.get(predRelPath) === currDist + 1) {
+        const existingNextHop = nextHopToTaint.get(predRelPath);
+        if (existingNextHop && currRelPath.localeCompare(existingNextHop) < 0) {
+          nextHopToTaint.set(predRelPath, currRelPath);
+          nearestTaintDoc.set(predRelPath, currTaintDoc);
         }
-
-        queue.push({ relPath: nextRelPath, path: nextPath });
       }
     }
-
-    return null;
   }
 
   const tainted_refs = [];
@@ -502,31 +591,32 @@ export function verifyLocalWorkspace(options = {}) {
             line: link.line ?? null,
           });
         }
-      } else {
-        const tainted = findNearestTainted(directDoc, srcDoc);
-        if (tainted) {
-          const targetDoc = tainted.targetDoc;
-          const taintKey = `${srcDoc.relPath}->${targetDoc.relPath}:${link.raw}:${link.line ?? ""}`;
-          if (!seenTaints.has(taintKey)) {
-            seenTaints.add(taintKey);
-            tainted_refs.push({
-              source_path: srcDoc.relPath,
-              source_id: srcDoc.id,
-              target_path: targetDoc.relPath,
-              target_id: targetDoc.id ?? targetDoc.relPath,
-              target_status: targetDoc.rawStatus || targetDoc.status,
-              ref: link.ref,
-              target_label: link.raw,
-              line: link.line ?? null,
-              via_path: tainted.viaPath,
-            });
+      } else if (distToTaint.has(directDoc.relPath)) {
+        const targetDoc = nearestTaintDoc.get(directDoc.relPath);
+        const taintKey = `${srcDoc.relPath}->${targetDoc.relPath}:${link.raw}:${link.line ?? ""}`;
+        if (!seenTaints.has(taintKey)) {
+          seenTaints.add(taintKey);
+          const viaPath = [directDoc.relPath];
+          let curr = directDoc.relPath;
+          while (nextHopToTaint.get(curr)) {
+            curr = nextHopToTaint.get(curr);
+            viaPath.push(curr);
           }
+          tainted_refs.push({
+            source_path: srcDoc.relPath,
+            source_id: srcDoc.id,
+            target_path: targetDoc.relPath,
+            target_id: targetDoc.id ?? targetDoc.relPath,
+            target_status: targetDoc.rawStatus || targetDoc.status,
+            ref: link.ref,
+            target_label: link.raw,
+            line: link.line ?? null,
+            via_path: viaPath,
+          });
         }
       }
     }
   }
-
-  const verification_results = [];
 
   for (const doc of docs) {
     if (!Array.isArray(doc.frontmatter.verify)) continue;
@@ -873,85 +963,172 @@ export function verifyLocalWorkspace(options = {}) {
         }
       } else if (kind === "lean") {
         const file = item.file ?? item.path;
-        if (!file) {
+        const symbol = typeof item.symbol === "string" ? item.symbol.trim() : "";
+        if (!file && !symbol) {
           verification_results.push({
             docPath: doc.relPath,
             kind: "lean",
             status: "fail",
-            message: "Missing file path in Lean verifier specification",
+            message: "Missing file or symbol in Lean verifier specification",
           });
           continue;
         }
-        let filePath = path.isAbsolute(file) ? file : path.resolve(rootDir, file);
-        if (!existsSync(filePath)) {
-          const docDirFile = path.resolve(path.dirname(doc.fullPath), file);
-          if (existsSync(docDirFile)) {
-            filePath = docDirFile;
-          }
-        }
-        if (!existsSync(filePath)) {
-          verification_results.push({
-            docPath: doc.relPath,
-            kind: "lean",
-            status: "fail",
-            message: `Lean file not found: ${file}`,
-          });
-          continue;
-        }
-        if (!isBinaryAvailable("lean")) {
-          verification_results.push({
-            docPath: doc.relPath,
-            kind: "lean",
-            status: "skipped",
-            message: "lean is not installed or not in PATH",
-          });
-          continue;
-        }
-        try {
-          const res = spawnSync("lean", [filePath], {
-            cwd: rootDir,
-            encoding: "utf8",
-            timeout: timeoutMs,
-          });
-          if (res.error) {
-            if (res.error.code === "ENOENT") {
-              verification_results.push({
-                docPath: doc.relPath,
-                kind: "lean",
-                status: "skipped",
-                message: "lean is not installed",
-              });
-            } else {
-              verification_results.push({
-                docPath: doc.relPath,
-                kind: "lean",
-                status: "fail",
-                message: res.error.message,
-              });
+        if (file) {
+          let filePath = path.isAbsolute(file) ? file : path.resolve(rootDir, file);
+          if (!existsSync(filePath)) {
+            const docDirFile = path.resolve(path.dirname(doc.fullPath), file);
+            if (existsSync(docDirFile)) {
+              filePath = docDirFile;
             }
-          } else if (res.status === 0) {
-            verification_results.push({
-              docPath: doc.relPath,
-              kind: "lean",
-              status: "pass",
-              message: "Lean verification succeeded",
-            });
-          } else {
-            const errMsg = (res.stderr || res.stdout || `Lean exited with code ${res.status}`).trim().split("\n")[0];
+          }
+          if (!existsSync(filePath)) {
             verification_results.push({
               docPath: doc.relPath,
               kind: "lean",
               status: "fail",
-              message: errMsg || `Lean exited with code ${res.status}`,
+              message: `Lean file not found: ${file}`,
+            });
+            continue;
+          }
+          if (!isBinaryAvailable("lean")) {
+            verification_results.push({
+              docPath: doc.relPath,
+              kind: "lean",
+              status: "skipped",
+              message: "lean is not installed or not in PATH",
+            });
+            continue;
+          }
+          try {
+            const res = spawnSync("lean", [filePath], {
+              cwd: rootDir,
+              encoding: "utf8",
+              timeout: timeoutMs,
+            });
+            if (res.error) {
+              if (res.error.code === "ENOENT") {
+                verification_results.push({
+                  docPath: doc.relPath,
+                  kind: "lean",
+                  status: "skipped",
+                  message: "lean is not installed",
+                });
+              } else {
+                verification_results.push({
+                  docPath: doc.relPath,
+                  kind: "lean",
+                  status: "fail",
+                  message: res.error.message,
+                });
+              }
+            } else if (res.status === 0) {
+              verification_results.push({
+                docPath: doc.relPath,
+                kind: "lean",
+                status: "pass",
+                message: "Lean verification succeeded",
+              });
+            } else {
+              const errMsg = (res.stderr || res.stdout || `Lean exited with code ${res.status}`).trim().split("\n")[0];
+              verification_results.push({
+                docPath: doc.relPath,
+                kind: "lean",
+                status: "fail",
+                message: errMsg || `Lean exited with code ${res.status}`,
+              });
+            }
+          } catch (error) {
+            verification_results.push({
+              docPath: doc.relPath,
+              kind: "lean",
+              status: "fail",
+              message: error instanceof Error ? error.message : String(error),
             });
           }
-        } catch (error) {
-          verification_results.push({
-            docPath: doc.relPath,
-            kind: "lean",
-            status: "fail",
-            message: error instanceof Error ? error.message : String(error),
-          });
+        } else {
+          if (!/^[A-Za-z_][\w.']*$/.test(symbol)) {
+            verification_results.push({
+              docPath: doc.relPath,
+              kind: "lean",
+              status: "fail",
+              message: `Invalid Lean symbol name: ${symbol}`,
+              alignment: "not_checked",
+            });
+            continue;
+          }
+          if (!isBinaryAvailable("lean")) {
+            verification_results.push({
+              docPath: doc.relPath,
+              kind: "lean",
+              status: "skipped",
+              message: "lean is not installed or not in PATH",
+              alignment: "not_checked",
+            });
+            continue;
+          }
+          let tmpDir = null;
+          try {
+            tmpDir = mkdtempSync(path.join(tmpdir(), "lean-verify-"));
+            const probeFile = path.join(tmpDir, "Probe.lean");
+            writeFileSync(probeFile, `#check ${symbol}\n`, "utf8");
+            const res = spawnSync("lean", [probeFile], {
+              cwd: rootDir,
+              encoding: "utf8",
+              timeout: timeoutMs,
+            });
+            if (res.error) {
+              if (res.error.code === "ENOENT") {
+                verification_results.push({
+                  docPath: doc.relPath,
+                  kind: "lean",
+                  status: "skipped",
+                  message: "lean is not installed",
+                  alignment: "not_checked",
+                });
+              } else {
+                verification_results.push({
+                  docPath: doc.relPath,
+                  kind: "lean",
+                  status: "fail",
+                  message: res.error.message,
+                  alignment: "not_checked",
+                });
+              }
+            } else if (res.status === 0) {
+              verification_results.push({
+                docPath: doc.relPath,
+                kind: "lean",
+                status: "pass",
+                message: (res.stdout || "").trim() || "Lean symbol check passed",
+                alignment: "not_checked",
+              });
+            } else {
+              const errMsg = (res.stderr || res.stdout || `Lean symbol check failed with code ${res.status}`).trim().split("\n")[0];
+              verification_results.push({
+                docPath: doc.relPath,
+                kind: "lean",
+                status: "fail",
+                message: errMsg || `Lean symbol check failed with code ${res.status}`,
+                alignment: "not_checked",
+              });
+            }
+          } catch (error) {
+            verification_results.push({
+              docPath: doc.relPath,
+              kind: "lean",
+              status: "fail",
+              message: error instanceof Error ? error.message : String(error),
+              alignment: "not_checked",
+            });
+          } finally {
+            if (tmpDir) {
+              try {
+                rmSync(tmpDir, { recursive: true, force: true });
+              } catch (_cleanupError) {
+                // ignore cleanup error
+              }
+            }
+          }
         }
       } else {
         verification_results.push({
