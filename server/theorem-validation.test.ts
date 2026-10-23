@@ -14,20 +14,13 @@ import {
   verifyDocumentContent,
 } from "./verification/runner.js";
 import {
+  ensureWorkspaceStatusesBackfilled,
   workspaceTheoremValidation,
   workspaceValidation,
 } from "./workspace-validation.js";
 
 function freshDb(): Database.Database {
-  const db = freshTestDb("cosheaf-thm-");
-  const retained: unknown[] = [];
-  const originalPrepare = db.prepare.bind(db);
-  db.prepare = ((source: string) => {
-    const stmt = originalPrepare(source);
-    retained.push(stmt);
-    return stmt;
-  }) as typeof db.prepare;
-  return db;
+  return freshTestDb("cosheaf-thm-");
 }
 
 describe("normalizeTheoremStatus and parseVerifySpecs", () => {
@@ -177,6 +170,62 @@ describe("direct and transitive dependency taint detection (tainted_refs)", () =
     const fullValidation = workspaceValidation(db, "owner/w");
     expect(fullValidation.tainted_refs).toEqual(theoremValidation.tainted_refs);
   });
+
+  it("backfills null doc_map statuses from canonical markdown on upgraded databases", async () => {
+    const db = freshDb();
+
+    indexPageBatch(db, "owner/w", [
+      {
+        path: "a.md",
+        body: "---\nid: a\nstatus: proved\n---\n# A\n\nSee [@b].\n",
+      },
+      {
+        path: "b.md",
+        body: "---\nid: b\nstatus: draft\n---\n# B\n",
+      },
+    ]);
+
+    db.prepare(
+      "UPDATE doc_map SET status = NULL WHERE workspace_slug = 'owner/w'",
+    ).run();
+
+    const backend = {
+      getRawFile: async (_o: string, _r: string, _ref: string, p: string) =>
+        p === "b.md"
+          ? "---\nid: b\nstatus: draft\n---\n# B\n"
+          : "---\nid: a\nstatus: proved\n---\n# A\n\nSee [@b].\n",
+    };
+
+    await ensureWorkspaceStatusesBackfilled(
+      db,
+      backend,
+      "owner",
+      "w",
+      "owner/w",
+    );
+
+    const res = workspaceValidation(db, "owner/w");
+    expect(res.tainted_refs).toHaveLength(1);
+    expect(res.tainted_refs?.[0]?.target_path).toBe("b.md");
+  });
+
+  it("resolves document-local crossrefs before workspace page IDs without false taint", () => {
+    const db = freshDb();
+
+    indexPageBatch(db, "owner/w", [
+      {
+        path: "a.md",
+        body: "---\nid: a\nstatus: proved\n---\n# Page A\n\n## Local Heading {#b}\n\nSee [@b].\n",
+      },
+      {
+        path: "b.md",
+        body: "---\nid: b\nstatus: draft\n---\n# Draft B\n",
+      },
+    ]);
+
+    const res = workspaceTheoremValidation(db, "owner/w");
+    expect(res.tainted_refs).toEqual([]);
+  });
 });
 
 describe("cyclic reference detection (cyclic_refs)", () => {
@@ -274,6 +323,50 @@ describe("cyclic reference detection (cyclic_refs)", () => {
 
     expect(fullValidation?.cyclic_refs ?? []).toEqual([]);
     expect(fullValidation?.tainted_refs).toHaveLength(3999);
+  });
+
+  it("validates an 8000-page all-proved reference chain in linear time without quadratic slowdown", () => {
+    const db = freshDb();
+    const count = 8000;
+
+    const insertDoc = db.prepare(
+      `INSERT INTO doc_map (workspace_slug, cosheaf_id, forgejo_id, title, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+    const insertBacklink = db.prepare(
+      `INSERT INTO backlinks (workspace_slug, src_id, src_path, target_id, target_label, line)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+
+    const seedChain = db.transaction(() => {
+      for (let i = 0; i < count; i++) {
+        const id = `page-${String(i).padStart(4, "0")}`;
+        const pagePath = `${id}.md`;
+        insertDoc.run("owner/w", id, pagePath, `Page ${i}`, "proved", 1700000000);
+
+        if (i < count - 1) {
+          const nextId = `page-${String(i + 1).padStart(4, "0")}`;
+          insertBacklink.run(
+            "owner/w",
+            id,
+            pagePath,
+            nextId,
+            `[@${nextId}]`,
+            1,
+          );
+        }
+      }
+    });
+
+    seedChain();
+
+    const start = Date.now();
+    const res = workspaceTheoremValidation(db, "owner/w");
+    const elapsed = Date.now() - start;
+
+    expect(res.tainted_refs).toEqual([]);
+    expect(res.cyclic_refs).toEqual([]);
+    expect(elapsed).toBeLessThan(500);
   });
 });
 
