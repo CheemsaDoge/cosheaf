@@ -381,6 +381,86 @@ verify:
     }
   });
 
+  it("rebuilds Lake module with '+' prefix before probing Lean symbol", () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), "cosheaf-lake-rebuild-agent-"));
+    const binDir = path.join(tmpDir, "bin");
+    const workDir = path.join(tmpDir, "work");
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(workDir, { recursive: true });
+
+    writeFileSync(path.join(workDir, "lakefile.toml"), 'name = "test"\n', "utf8");
+    writeFileSync(path.join(workDir, "MyMod.lean"), "-- MyMod without the symbol\n", "utf8");
+
+    const leanScript = path.join(binDir, "lean");
+    writeFileSync(
+      leanScript,
+      `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  exit 0
+fi
+printf 'stale pass\\n'
+exit 0
+`,
+      "utf8",
+    );
+    chmodSync(leanScript, 0o755);
+
+    const lakeScript = path.join(binDir, "lake");
+    writeFileSync(
+      lakeScript,
+      `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  exit 0
+fi
+if [ "$1" = "build" ]; then
+  if [ "$2" = "+MyMod" ]; then
+    printf "error: unknown identifier 'deleted_symbol'\\n" >&2
+    exit 1
+  else
+    printf "error: expected +MyMod target, got '%s'\\n" "$2" >&2
+    exit 1
+  fi
+fi
+if [ "$1" = "env" ] && [ "$2" = "lean" ]; then
+  exec lean "$3"
+fi
+exit 1
+`,
+      "utf8",
+    );
+    chmodSync(lakeScript, 0o755);
+
+    writeFileSync(
+      path.join(workDir, "doc.md"),
+      `---
+id: lean-rebuild-test
+status: proved
+verify:
+  - kind: lean
+    symbol: MyMod.deleted_symbol
+---
+# Lake Rebuild Test
+`,
+      "utf8",
+    );
+
+    const oldPath = process.env.PATH;
+    try {
+      process.env.PATH = `${binDir}:${oldPath}`;
+      const result = verifyLocalWorkspace({ dir: workDir });
+      expect(result.ok).toBe(false);
+      expect(result.verification_results[0].status).toBe("fail");
+      expect(result.verification_results[0].message).toContain("unknown identifier 'deleted_symbol'");
+    } finally {
+      process.env.PATH = oldPath;
+      try {
+        rmSync(tmpDir, { recursive: true, force: true });
+      } catch (_err) {
+        // cleanup ignore
+      }
+    }
+  });
+
   it("invokes lake env lean for file-only Lean verify specifications in a Lake project", () => {
     const tmpDir = mkdtempSync(path.join(tmpdir(), "cosheaf-lean-file-lake-"));
     const binDir = path.join(tmpDir, "bin");

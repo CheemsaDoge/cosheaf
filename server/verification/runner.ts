@@ -700,7 +700,8 @@ export function runVerifySpec(
         const env = { ...process.env, LEAN_SRC_PATH: workspaceRoot };
 
         if (hasLake && modules.length > 0) {
-          const buildRes = spawnSync("lake", ["build", ...modules], {
+          const moduleTargets = modules.map((m) => `+${m}`);
+          const buildRes = spawnSync("lake", ["build", ...moduleTargets], {
             cwd: workspaceRoot,
             env,
             encoding: "utf8",
@@ -711,7 +712,7 @@ export function runVerifySpec(
               docPath,
               kind: "lean",
               status: "error",
-              command: ["lake", "build", ...modules],
+              command: ["lake", "build", ...moduleTargets],
               exitCode: buildRes.status,
               durationMs: Date.now() - startTime,
               message: buildRes.error.message,
@@ -729,7 +730,7 @@ export function runVerifySpec(
                 docPath,
                 kind: "lean",
                 status: "fail",
-                command: ["lake", "build", ...modules],
+                command: ["lake", "build", ...moduleTargets],
                 exitCode: buildRes.status,
                 durationMs: Date.now() - startTime,
                 message:

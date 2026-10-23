@@ -1268,7 +1268,8 @@ export function verifyLocalWorkspace(options = {}) {
               isBinaryAvailable("lake");
 
             if (hasLake && modules.length > 0) {
-              const buildRes = spawnSync("lake", ["build", ...modules], {
+              const moduleTargets = modules.map((m) => `+${m}`);
+              const buildRes = spawnSync("lake", ["build", ...moduleTargets], {
                 cwd: rootDir,
                 env: { ...process.env, LEAN_SRC_PATH: rootDir },
                 encoding: "utf8",

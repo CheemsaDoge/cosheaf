@@ -638,7 +638,7 @@ describe("executable verifiers (runVerifySpec & verifyDocumentContent)", () => {
       });
 
       expect(res.status).toBe("fail");
-      expect(res.command).toEqual(["lake", "build", "MyMod"]);
+      expect(res.command).toEqual(["lake", "build", "+MyMod"]);
       expect(res.message).toContain("unknown identifier 'deleted_symbol'");
     } finally {
       process.env.PATH = originalPath;
