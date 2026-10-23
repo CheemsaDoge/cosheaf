@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 
-import { readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
 import process from "node:process";
 import { Command } from "commander";
+import { parse as parseYaml } from "yaml";
 import { defaultApiUrl, loadDotenvDev } from "./lib/env-dev.mjs";
 
 class HttpError extends Error {
@@ -228,6 +231,625 @@ function printResult(result, json) {
   }
 }
 
+const SKIP_DIRS = new Set([".git", "node_modules", "dist", ".cosheaf"]);
+
+function findMarkdownFiles(dir) {
+  const mdFiles = [];
+  function walk(currentDir) {
+    let entries;
+    try {
+      entries = readdirSync(currentDir, { withFileTypes: true });
+    } catch (_error) {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        if (!SKIP_DIRS.has(entry.name)) {
+          walk(path.join(currentDir, entry.name));
+        }
+      } else if (entry.isFile() && entry.name.endsWith(".md")) {
+        mdFiles.push(path.join(currentDir, entry.name));
+      }
+    }
+  }
+  walk(dir);
+  mdFiles.sort();
+  return mdFiles;
+}
+
+function extractFrontmatterAndBody(content) {
+  if (!content.startsWith("---")) {
+    return { frontmatter: {}, body: content };
+  }
+  const openLen = content.startsWith("---\r\n") ? 5 : (content.startsWith("---\n") ? 4 : null);
+  if (!openLen) {
+    return { frontmatter: {}, body: content };
+  }
+  const closeMatch = content.slice(openLen).match(/\r?\n---\r?(\n|$)/);
+  if (!closeMatch) {
+    return { frontmatter: {}, body: content };
+  }
+  const yamlEnd = openLen + closeMatch.index;
+  const bodyStart = yamlEnd + closeMatch[0].length;
+  const yamlText = content.slice(openLen, yamlEnd);
+  const body = content.slice(bodyStart);
+  try {
+    const parsed = parseYaml(yamlText);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return { frontmatter: parsed, body };
+    }
+  } catch (_error) {
+    // Bad yaml
+  }
+  return { frontmatter: {}, body: content };
+}
+
+function extractBracketedRefs(body) {
+  const stripped = body
+    .replace(/```[\s\S]*?```/g, "")
+    .replace(/~~~[\s\S]*?~~~/g, "")
+    .replace(/`[^`\n]*`/g, "");
+
+  const refs = [];
+  const bracketRegex = /\[([^\]\n]+)\]/g;
+  let match;
+  while ((match = bracketRegex.exec(stripped)) !== null) {
+    const inner = match[1];
+    const atRegex = /(?:^|[\s;,(-])@([A-Za-z0-9_][\w:./'-]*)/g;
+    let atMatch;
+    while ((atMatch = atRegex.exec(inner)) !== null) {
+      refs.push(atMatch[1]);
+    }
+  }
+  return refs;
+}
+
+function normalizeTheoremStatus(raw) {
+  if (typeof raw !== "string") return "proved";
+  const s = raw.trim().toLowerCase();
+  if (s === "draft" || s === "conjecture" || s === "raw" || s === "locally_tested") {
+    return "draft";
+  }
+  if (s === "refuted" || s === "obsolete") {
+    return "refuted";
+  }
+  return "proved";
+}
+
+const binaryAvailabilityCache = new Map();
+function isBinaryAvailable(cmd) {
+  if (binaryAvailabilityCache.has(cmd)) {
+    return binaryAvailabilityCache.get(cmd);
+  }
+  try {
+    const res = spawnSync(cmd, ["--version"], { stdio: "ignore" });
+    const available = !(res.error && res.error.code === "ENOENT");
+    binaryAvailabilityCache.set(cmd, available);
+    return available;
+  } catch (_error) {
+    binaryAvailabilityCache.set(cmd, false);
+    return false;
+  }
+}
+
+export function verifyLocalWorkspace(options = {}) {
+  const rootDir = path.resolve(options.dir ?? process.cwd());
+  if (!existsSync(rootDir)) {
+    return {
+      ok: false,
+      dir: rootDir,
+      checked_files: 0,
+      verification_results: [
+        {
+          docPath: rootDir,
+          kind: "workspace",
+          status: "error",
+          message: `Directory does not exist: ${rootDir}`,
+        },
+      ],
+      tainted_refs: [],
+    };
+  }
+
+  const mdFilePaths = findMarkdownFiles(rootDir);
+  const docs = [];
+
+  for (const fullPath of mdFilePaths) {
+    const relPath = path.relative(rootDir, fullPath).split(path.sep).join("/");
+    let content = "";
+    try {
+      content = readFileSync(fullPath, "utf8");
+    } catch (_readError) {
+      continue;
+    }
+    const { frontmatter, body } = extractFrontmatterAndBody(content);
+    const id = typeof frontmatter.id === "string" && frontmatter.id.trim() ? frontmatter.id.trim() : null;
+    const rawStatus = typeof frontmatter.status === "string" ? frontmatter.status.trim() : null;
+    const status = normalizeTheoremStatus(rawStatus);
+    const refs = extractBracketedRefs(body);
+    const baseName = path.basename(relPath);
+    const stem = path.basename(relPath, ".md");
+    const relStem = relPath.replace(/\.md$/i, "");
+
+    docs.push({
+      fullPath,
+      relPath,
+      baseName,
+      stem,
+      relStem,
+      id,
+      rawStatus,
+      status,
+      frontmatter,
+      body,
+      refs,
+    });
+  }
+
+  const docById = new Map();
+  const docByPath = new Map();
+
+  for (const doc of docs) {
+    if (doc.id) {
+      docById.set(doc.id, doc);
+    }
+    docByPath.set(doc.relPath, doc);
+    if (!docByPath.has(doc.relStem)) docByPath.set(doc.relStem, doc);
+    if (!docByPath.has(doc.baseName)) docByPath.set(doc.baseName, doc);
+    if (!docByPath.has(doc.stem)) docByPath.set(doc.stem, doc);
+  }
+
+  function resolveTargetDoc(refKey) {
+    const cleanKey = refKey.split("#")[0].trim();
+    if (!cleanKey) return null;
+    return docById.get(cleanKey) || docByPath.get(cleanKey) || null;
+  }
+
+  const tainted_refs = [];
+  const seenTaints = new Set();
+
+  for (const doc of docs) {
+    if (doc.status !== "proved") continue;
+    for (const refKey of doc.refs) {
+      const targetDoc = resolveTargetDoc(refKey);
+      if (!targetDoc || targetDoc === doc) continue;
+      if (targetDoc.status !== "proved") {
+        const taintKey = `${doc.relPath}->${targetDoc.relPath}`;
+        if (!seenTaints.has(taintKey)) {
+          seenTaints.add(taintKey);
+          tainted_refs.push({
+            source_path: doc.relPath,
+            source_id: doc.id,
+            target_path: targetDoc.relPath,
+            target_id: targetDoc.id ?? refKey,
+            target_status: targetDoc.rawStatus || targetDoc.status,
+            ref: refKey,
+          });
+        }
+      }
+    }
+  }
+
+  const verification_results = [];
+
+  for (const doc of docs) {
+    if (!Array.isArray(doc.frontmatter.verify)) continue;
+    for (const item of doc.frontmatter.verify) {
+      if (!item || typeof item !== "object") continue;
+      const kind = String(item.kind ?? "").trim().toLowerCase();
+      const timeoutMs = typeof item.timeoutMs === "number" && item.timeoutMs > 0 ? item.timeoutMs : 30000;
+
+      if (kind === "python") {
+        const script = item.script ?? item.file ?? item.path;
+        if (!script) {
+          verification_results.push({
+            docPath: doc.relPath,
+            kind: "python",
+            status: "fail",
+            message: "Missing script path in python verifier specification",
+          });
+          continue;
+        }
+        let scriptPath = path.isAbsolute(script) ? script : path.resolve(rootDir, script);
+        if (!existsSync(scriptPath)) {
+          const docDirScript = path.resolve(path.dirname(doc.fullPath), script);
+          if (existsSync(docDirScript)) {
+            scriptPath = docDirScript;
+          }
+        }
+        if (!existsSync(scriptPath)) {
+          verification_results.push({
+            docPath: doc.relPath,
+            kind: "python",
+            status: "fail",
+            message: `Checker script not found: ${script}`,
+          });
+          continue;
+        }
+        if (!isBinaryAvailable("python3")) {
+          verification_results.push({
+            docPath: doc.relPath,
+            kind: "python",
+            status: "skipped",
+            message: "python3 is not installed or not in PATH",
+          });
+          continue;
+        }
+        try {
+          const res = spawnSync("python3", [scriptPath, doc.fullPath], {
+            cwd: rootDir,
+            encoding: "utf8",
+            timeout: timeoutMs,
+          });
+          if (res.error) {
+            if (res.error.code === "ENOENT") {
+              verification_results.push({
+                docPath: doc.relPath,
+                kind: "python",
+                status: "skipped",
+                message: "python3 is not installed",
+              });
+            } else if (res.error.code === "ETIMEDOUT") {
+              verification_results.push({
+                docPath: doc.relPath,
+                kind: "python",
+                status: "fail",
+                message: `Execution timed out after ${timeoutMs}ms`,
+              });
+            } else {
+              verification_results.push({
+                docPath: doc.relPath,
+                kind: "python",
+                status: "fail",
+                message: res.error.message,
+              });
+            }
+          } else if (res.status === 0) {
+            const firstLine = (res.stdout || "Verification passed").trim().split("\n")[0] || "Verification passed";
+            verification_results.push({
+              docPath: doc.relPath,
+              kind: "python",
+              status: "pass",
+              message: firstLine,
+            });
+          } else {
+            const errMsg = (res.stderr || res.stdout || `Exited with code ${res.status}`).trim().split("\n")[0];
+            verification_results.push({
+              docPath: doc.relPath,
+              kind: "python",
+              status: "fail",
+              message: errMsg || `Exited with code ${res.status}`,
+            });
+          }
+        } catch (error) {
+          verification_results.push({
+            docPath: doc.relPath,
+            kind: "python",
+            status: "fail",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      } else if (kind === "sat") {
+        const file = item.file ?? item.path;
+        if (!file) {
+          verification_results.push({
+            docPath: doc.relPath,
+            kind: "sat",
+            status: "fail",
+            message: "Missing file path in SAT verifier specification",
+          });
+          continue;
+        }
+        let filePath = path.isAbsolute(file) ? file : path.resolve(rootDir, file);
+        if (!existsSync(filePath)) {
+          const docDirFile = path.resolve(path.dirname(doc.fullPath), file);
+          if (existsSync(docDirFile)) {
+            filePath = docDirFile;
+          }
+        }
+        if (!existsSync(filePath)) {
+          verification_results.push({
+            docPath: doc.relPath,
+            kind: "sat",
+            status: "fail",
+            message: `SAT file not found: ${file}`,
+          });
+          continue;
+        }
+        if (!isBinaryAvailable("kissat")) {
+          verification_results.push({
+            docPath: doc.relPath,
+            kind: "sat",
+            status: "skipped",
+            message: "kissat is not installed or not in PATH",
+          });
+          continue;
+        }
+        try {
+          const res = spawnSync("kissat", [filePath], {
+            cwd: rootDir,
+            encoding: "utf8",
+            timeout: timeoutMs,
+          });
+          if (res.error) {
+            if (res.error.code === "ENOENT") {
+              verification_results.push({
+                docPath: doc.relPath,
+                kind: "sat",
+                status: "skipped",
+                message: "kissat is not installed",
+              });
+            } else {
+              verification_results.push({
+                docPath: doc.relPath,
+                kind: "sat",
+                status: "fail",
+                message: res.error.message,
+              });
+            }
+          } else {
+            const combined = `${res.stdout || ""}\n${res.stderr || ""}`.toLowerCase();
+            const outcome = combined.includes("unsat") || res.status === 20
+              ? "unsat"
+              : combined.includes("sat") || res.status === 10
+                ? "sat"
+                : "unknown";
+            const expected = typeof item.expect === "string" ? item.expect.toLowerCase() : null;
+            if (expected) {
+              if (outcome === expected) {
+                verification_results.push({
+                  docPath: doc.relPath,
+                  kind: "sat",
+                  status: "pass",
+                  message: `SAT solver returned expected ${expected}`,
+                });
+              } else {
+                verification_results.push({
+                  docPath: doc.relPath,
+                  kind: "sat",
+                  status: "fail",
+                  message: `SAT solver outcome '${outcome}' did not match expected '${expected}'`,
+                });
+              }
+            } else if (outcome === "sat" || outcome === "unsat" || res.status === 0) {
+              verification_results.push({
+                docPath: doc.relPath,
+                kind: "sat",
+                status: "pass",
+                message: `SAT solver completed (${outcome})`,
+              });
+            } else {
+              verification_results.push({
+                docPath: doc.relPath,
+                kind: "sat",
+                status: "fail",
+                message: `SAT solver failed with exit code ${res.status}`,
+              });
+            }
+          }
+        } catch (error) {
+          verification_results.push({
+            docPath: doc.relPath,
+            kind: "sat",
+            status: "fail",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      } else if (kind === "smt") {
+        const file = item.file ?? item.path;
+        if (!file) {
+          verification_results.push({
+            docPath: doc.relPath,
+            kind: "smt",
+            status: "fail",
+            message: "Missing file path in SMT verifier specification",
+          });
+          continue;
+        }
+        let filePath = path.isAbsolute(file) ? file : path.resolve(rootDir, file);
+        if (!existsSync(filePath)) {
+          const docDirFile = path.resolve(path.dirname(doc.fullPath), file);
+          if (existsSync(docDirFile)) {
+            filePath = docDirFile;
+          }
+        }
+        if (!existsSync(filePath)) {
+          verification_results.push({
+            docPath: doc.relPath,
+            kind: "smt",
+            status: "fail",
+            message: `SMT file not found: ${file}`,
+          });
+          continue;
+        }
+        if (!isBinaryAvailable("z3")) {
+          verification_results.push({
+            docPath: doc.relPath,
+            kind: "smt",
+            status: "skipped",
+            message: "z3 is not installed or not in PATH",
+          });
+          continue;
+        }
+        try {
+          const res = spawnSync("z3", ["-smt2", filePath], {
+            cwd: rootDir,
+            encoding: "utf8",
+            timeout: timeoutMs,
+          });
+          if (res.error) {
+            if (res.error.code === "ENOENT") {
+              verification_results.push({
+                docPath: doc.relPath,
+                kind: "smt",
+                status: "skipped",
+                message: "z3 is not installed",
+              });
+            } else {
+              verification_results.push({
+                docPath: doc.relPath,
+                kind: "smt",
+                status: "fail",
+                message: res.error.message,
+              });
+            }
+          } else {
+            let outcome = "unknown";
+            for (const line of `${res.stdout || ""}\n${res.stderr || ""}`.split(/\r?\n/)) {
+              const trimmed = line.trim().toLowerCase();
+              if (trimmed === "sat" || trimmed === "unsat") {
+                outcome = trimmed;
+                break;
+              }
+            }
+            const expected = typeof item.expect === "string" ? item.expect.toLowerCase() : null;
+            if (expected) {
+              if (outcome === expected) {
+                verification_results.push({
+                  docPath: doc.relPath,
+                  kind: "smt",
+                  status: "pass",
+                  message: `SMT solver returned expected ${expected}`,
+                });
+              } else {
+                verification_results.push({
+                  docPath: doc.relPath,
+                  kind: "smt",
+                  status: "fail",
+                  message: `SMT solver outcome '${outcome}' did not match expected '${expected}'`,
+                });
+              }
+            } else if (outcome === "sat" || outcome === "unsat" || res.status === 0) {
+              verification_results.push({
+                docPath: doc.relPath,
+                kind: "smt",
+                status: "pass",
+                message: `SMT solver completed (${outcome})`,
+              });
+            } else {
+              verification_results.push({
+                docPath: doc.relPath,
+                kind: "smt",
+                status: "fail",
+                message: `SMT solver failed with exit code ${res.status}`,
+              });
+            }
+          }
+        } catch (error) {
+          verification_results.push({
+            docPath: doc.relPath,
+            kind: "smt",
+            status: "fail",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      } else if (kind === "lean") {
+        const file = item.file ?? item.path;
+        if (!file) {
+          verification_results.push({
+            docPath: doc.relPath,
+            kind: "lean",
+            status: "fail",
+            message: "Missing file path in Lean verifier specification",
+          });
+          continue;
+        }
+        let filePath = path.isAbsolute(file) ? file : path.resolve(rootDir, file);
+        if (!existsSync(filePath)) {
+          const docDirFile = path.resolve(path.dirname(doc.fullPath), file);
+          if (existsSync(docDirFile)) {
+            filePath = docDirFile;
+          }
+        }
+        if (!existsSync(filePath)) {
+          verification_results.push({
+            docPath: doc.relPath,
+            kind: "lean",
+            status: "fail",
+            message: `Lean file not found: ${file}`,
+          });
+          continue;
+        }
+        if (!isBinaryAvailable("lean")) {
+          verification_results.push({
+            docPath: doc.relPath,
+            kind: "lean",
+            status: "skipped",
+            message: "lean is not installed or not in PATH",
+          });
+          continue;
+        }
+        try {
+          const res = spawnSync("lean", [filePath], {
+            cwd: rootDir,
+            encoding: "utf8",
+            timeout: timeoutMs,
+          });
+          if (res.error) {
+            if (res.error.code === "ENOENT") {
+              verification_results.push({
+                docPath: doc.relPath,
+                kind: "lean",
+                status: "skipped",
+                message: "lean is not installed",
+              });
+            } else {
+              verification_results.push({
+                docPath: doc.relPath,
+                kind: "lean",
+                status: "fail",
+                message: res.error.message,
+              });
+            }
+          } else if (res.status === 0) {
+            verification_results.push({
+              docPath: doc.relPath,
+              kind: "lean",
+              status: "pass",
+              message: "Lean verification succeeded",
+            });
+          } else {
+            const errMsg = (res.stderr || res.stdout || `Lean exited with code ${res.status}`).trim().split("\n")[0];
+            verification_results.push({
+              docPath: doc.relPath,
+              kind: "lean",
+              status: "fail",
+              message: errMsg || `Lean exited with code ${res.status}`,
+            });
+          }
+        } catch (error) {
+          verification_results.push({
+            docPath: doc.relPath,
+            kind: "lean",
+            status: "fail",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      } else {
+        verification_results.push({
+          docPath: doc.relPath,
+          kind: kind || "unknown",
+          status: "skipped",
+          message: `Unsupported verifier kind '${kind}'`,
+        });
+      }
+    }
+  }
+
+  const hasFailures = verification_results.some(
+    (r) => r.status === "fail" || r.status === "error"
+  );
+  const ok = !hasFailures && tainted_refs.length === 0;
+
+  return {
+    ok,
+    dir: rootDir,
+    checked_files: mdFilePaths.length,
+    verification_results,
+    tainted_refs,
+  };
+}
+
 export function buildProgram() {
   const program = new Command("cosheaf-tea")
     .description("tea-shaped Cosheaf typed API helper for AI clients")
@@ -235,6 +857,27 @@ export function buildProgram() {
     .option("--workspace <owner/repo>", "Cosheaf workspace", process.env.COSHEAF_WORKSPACE)
     .option("--token <token>", "Cosheaf API token; defaults to COSHEAF_TOKEN, COSHEAF_PAT, or COSHEAF_API_TOKEN")
     .option("--json", "print machine-readable JSON", false);
+
+  program
+    .command("verify")
+    .description("verify local markdown theorem status dependencies and executable verifiers")
+    .option("--dir <path>", "workspace directory to verify", process.cwd())
+    .action((opts) => {
+      const globals = program.opts();
+      const result = verifyLocalWorkspace({ dir: opts.dir });
+      if (globals.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(`Verified ${result.checked_files} markdown file(s) in ${result.dir}`);
+        for (const r of result.verification_results) {
+          console.log(`  [${r.status.toUpperCase()}] ${r.docPath} (${r.kind}): ${r.message}`);
+        }
+        for (const t of result.tainted_refs) {
+          console.log(`  [TAINTED] ${t.source_path} (proved) depends on ${t.target_path} (${t.target_status})`);
+        }
+      }
+      if (!result.ok) process.exitCode = 1;
+    });
 
   program
     .command("pr-from-files")
